@@ -1,0 +1,34 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Test binaries
+test_*
+debug_*
+check_*
+magpie-tts
+
+# Generated data (large files)
+weights/
+test_data/
+inspect_output/
+*.bin
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# ggml is a symlink to external directory
+ggml

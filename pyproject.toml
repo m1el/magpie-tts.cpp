@@ -1,0 +1,16 @@
+[project]
+name = "magpie-cpp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nemo-toolkit[tts]",
+    "soundfile",
+    "librosa",
+    "matplotlib",
+    "gguf>=0.17.1",
+]
+
+[tool.uv.sources]
+nemo-toolkit = { path = "../NeMo" }
