@@ -969,6 +969,10 @@ ggml_tensor * magpie_build_audio_embedding(
         }
     }
 
+    // Scale by 1/(num_codebooks * frame_stacking_factor)
+    // For Magpie: num_codebooks=8, frame_stacking_factor=1, so divide by 8
+    sum = ggml_scale(ctx, sum, 1.0f / 8.0f);
+
     return sum;
 }
 
@@ -1415,14 +1419,16 @@ ggml_tensor * magpie_build_cross_attention(
     return output;
 }
 
-ggml_tensor * magpie_build_decoder_layer(
+// Build decoder layer with optional shared causal mask
+static ggml_tensor * magpie_build_decoder_layer_with_mask(
     ggml_context * ctx,
     ggml_tensor * input,
     ggml_tensor * encoder_out,
     int layer_idx,
     magpie_decoder_layer * layer,
     magpie_kv_cache * kv_cache,
-    const magpie_hparams * hparams) {
+    const magpie_hparams * hparams,
+    ggml_tensor * shared_mask) {
     // Decoder layer structure (no KV cache for now - full sequence):
     // 1. norm_self -> self_attention (causal) -> residual
     // 2. norm_xa_query -> cross_attention -> residual
@@ -1439,10 +1445,13 @@ ggml_tensor * magpie_build_decoder_layer(
     struct ggml_tensor * residual = input;
     struct ggml_tensor * x = magpie_build_layer_norm(ctx, input, layer->norm_self_w, hparams->eps);
 
-    // Create causal mask for self-attention
-    struct ggml_tensor * sa_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, seq_len);
-    ggml_set_name(sa_mask, "dec_sa_mask");
-    ggml_set_input(sa_mask);
+    // Use shared mask if provided, otherwise create new one
+    struct ggml_tensor * sa_mask = shared_mask;
+    if (!sa_mask) {
+        sa_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, seq_len);
+        ggml_set_name(sa_mask, "dec_sa_mask");
+        ggml_set_input(sa_mask);
+    }
 
     x = magpie_build_self_attention_with_mask(ctx, x, layer->sa_qkv_w, layer->sa_out_w,
                                                hparams->dec_sa_heads, true, sa_mask);
@@ -1470,6 +1479,17 @@ ggml_tensor * magpie_build_decoder_layer(
     x = ggml_add(ctx, x, residual);
 
     return x;
+}
+
+ggml_tensor * magpie_build_decoder_layer(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * encoder_out,
+    int layer_idx,
+    magpie_decoder_layer * layer,
+    magpie_kv_cache * kv_cache,
+    const magpie_hparams * hparams) {
+    return magpie_build_decoder_layer_with_mask(ctx, input, encoder_out, layer_idx, layer, kv_cache, hparams, nullptr);
 }
 
 ggml_tensor * magpie_build_rms_norm(
@@ -1542,30 +1562,456 @@ bool magpie_encode_text(
     magpie_context * ctx,
     const int32_t * tokens,
     int n_tokens) {
-    (void)ctx; (void)tokens; (void)n_tokens;
-    return false;  // TODO
+    if (!ctx || !tokens || n_tokens <= 0) {
+        fprintf(stderr, "magpie_encode_text: invalid args\n");
+        return false;
+    }
+
+    const auto & hp = ctx->model.hparams;
+
+    // Build compute graph for encoder
+    size_t ctx_size = ggml_tensor_overhead() * 512 + 128 * 1024 * 1024;
+    struct ggml_init_params params = { ctx_size, nullptr, true };
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "magpie_encode_text: failed to init context\n");
+        return false;
+    }
+
+    // Create input tensor for tokens
+    struct ggml_tensor * input_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(input_tokens, "input_tokens");
+    ggml_set_input(input_tokens);
+
+    // Text embedding lookup
+    struct ggml_tensor * embedded = magpie_build_text_embedding(ctx0, input_tokens, &ctx->model.embeddings);
+    if (!embedded) {
+        fprintf(stderr, "magpie_encode_text: text embedding failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Full encoder: embedding + pos + 6 layers + final norm
+    struct ggml_tensor * encoded = magpie_build_full_encoder(ctx0, embedded, &ctx->model.encoder, &hp);
+    if (!encoded) {
+        fprintf(stderr, "magpie_encode_text: encoder failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_set_name(encoded, "encoder_output");
+    ggml_set_output(encoded);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 8192, false);
+    ggml_build_forward_expand(gf, encoded);
+
+    // Allocate and compute
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_reserve(allocr, gf) || !ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "magpie_encode_text: graph alloc failed\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Set input tokens
+    ggml_backend_tensor_set(input_tokens, tokens, 0, n_tokens * sizeof(int32_t));
+
+    // Fill causal mask for encoder (NeMo encoder uses causal attention)
+    struct ggml_tensor * mask = ggml_get_tensor(ctx0, "causal_mask");
+    if (mask) {
+        std::vector<float> mask_data(n_tokens * n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            for (int j = 0; j < n_tokens; j++) {
+                mask_data[i * n_tokens + j] = (j <= i) ? 0.0f : -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    }
+
+    // Compute
+    if (ggml_backend_graph_compute(ctx->model.backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "magpie_encode_text: compute failed\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Store encoder output in state
+    ctx->state.encoder_output.resize(hp.d_model * n_tokens);
+    ggml_backend_tensor_get(encoded, ctx->state.encoder_output.data(), 0,
+                            ctx->state.encoder_output.size() * sizeof(float));
+    ctx->state.enc_seq_len = n_tokens;
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+
+    return true;
 }
 
 bool magpie_decode_step(
     magpie_context * ctx,
     std::vector<float> & logits) {
+    // This function runs one decoder step and returns logits
+    // For now, use the full synthesis function which handles the complete loop
+    // This is a placeholder for incremental decoding with KV cache
     (void)ctx; (void)logits;
-    return false;  // TODO
+    fprintf(stderr, "magpie_decode_step: use magpie_synthesize_codes for now\n");
+    return false;
 }
 
 std::vector<int32_t> magpie_sample_frame(
     magpie_context * ctx,
     const std::vector<float> & logits) {
-    (void)ctx; (void)logits;
-    return {};  // TODO
+    // Sample codes from logits using local transformer
+    // logits should be [num_codebooks * vocab_per_cb] from final_proj
+    // This function extracts the first codebook's logits and samples all 8 codes
+
+    if (!ctx || logits.empty()) return {};
+
+    const auto & hp = ctx->model.hparams;
+
+    // For proper sampling, we need the decoder hidden state, not just logits
+    // The logits from final_proj are coarse; local transformer refines them
+    // This function is a placeholder; use magpie_local_transformer_sample_all instead
+
+    // Simple argmax on each codebook's slice
+    std::vector<int32_t> codes(8);
+    for (int cb = 0; cb < 8; cb++) {
+        int offset = cb * hp.vocab_per_cb;
+        float max_val = logits[offset];
+        int max_idx = 0;
+        for (int i = 1; i < hp.vocab_per_cb; i++) {
+            if (logits[offset + i] > max_val) {
+                max_val = logits[offset + i];
+                max_idx = i;
+            }
+        }
+        codes[cb] = max_idx;
+    }
+
+    return codes;
+}
+
+// Build full decoder forward pass (without KV cache - full sequence)
+static ggml_tensor * build_full_decoder(
+    ggml_context * ctx0,
+    ggml_tensor * decoder_input,      // [d_model, dec_seq]
+    ggml_tensor * encoder_output,     // [d_model, enc_seq]
+    magpie_decoder * decoder,
+    const magpie_hparams * hparams) {
+
+    if (!decoder_input || !encoder_output || !decoder || !hparams) return nullptr;
+
+    const int64_t dec_seq = decoder_input->ne[1];
+
+    // Add position embeddings
+    struct ggml_tensor * x = magpie_build_add_position_embeddings(
+        ctx0, decoder_input, decoder->pos_emb_w, 0);
+
+    // Create shared causal mask for self-attention (shared across all layers)
+    struct ggml_tensor * sa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dec_seq, dec_seq);
+    ggml_set_name(sa_mask, "dec_sa_mask");
+    ggml_set_input(sa_mask);
+
+    // Process through all decoder layers with shared mask
+    for (int l = 0; l < hparams->dec_layers; l++) {
+        x = magpie_build_decoder_layer_with_mask(ctx0, x, encoder_output, l,
+                                                  &decoder->layers[l], nullptr, hparams, sa_mask);
+        if (!x) {
+            fprintf(stderr, "magpie: decoder layer %d failed\n", l);
+            return nullptr;
+        }
+    }
+
+    // Final norm
+    x = magpie_build_layer_norm(ctx0, x, decoder->norm_out_w, hparams->eps);
+
+    return x;
 }
 
 std::vector<int32_t> magpie_synthesize_codes(
     magpie_context * ctx,
     const int32_t * tokens,
     int n_tokens) {
-    (void)ctx; (void)tokens; (void)n_tokens;
-    return {};  // TODO
+
+    if (!ctx || !tokens || n_tokens <= 0) {
+        fprintf(stderr, "magpie_synthesize_codes: invalid args\n");
+        return {};
+    }
+
+    const auto & hp = ctx->model.hparams;
+
+    // Step 1: Encode text
+    fprintf(stderr, "magpie: encoding text (%d tokens)...\n", n_tokens);
+    if (!magpie_encode_text(ctx, tokens, n_tokens)) {
+        fprintf(stderr, "magpie_synthesize_codes: text encoding failed\n");
+        return {};
+    }
+    fprintf(stderr, "magpie: text encoded, output shape [%d, %d]\n", hp.d_model, ctx->state.enc_seq_len);
+
+    // Reset generation state
+    ctx->state.generated_codes.clear();
+    ctx->state.n_generated_frames = 0;
+
+    // Step 2: Prepare baked context
+    // The baked context is [context_frames, d_model] = [110, 768]
+    std::vector<float> context_data(hp.context_frames * hp.d_model);
+
+    // Extract baked context for speaker
+    {
+        size_t ctx_size = ggml_tensor_overhead() * 16 + 1024 * 1024;
+        struct ggml_init_params params = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        struct ggml_tensor * speaker_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(speaker_idx, "speaker_idx");
+        ggml_set_input(speaker_idx);
+
+        // baked_context_w is [d_model * context_frames, num_speakers] after transpose in GGML
+        // Actually check the shape
+        auto * bcw = ctx->model.embeddings.baked_context_w;
+        fprintf(stderr, "magpie: baked_context_w shape [%lld, %lld]\n",
+                (long long)bcw->ne[0], (long long)bcw->ne[1]);
+
+        struct ggml_tensor * flat = ggml_get_rows(ctx0, bcw, speaker_idx);
+        ggml_set_name(flat, "context_flat");
+        ggml_set_output(flat);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, flat);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        int32_t sid = ctx->speaker_id;
+        ggml_backend_tensor_set(speaker_idx, &sid, 0, sizeof(int32_t));
+        ggml_backend_graph_compute(ctx->model.backend, gf);
+
+        ggml_backend_tensor_get(flat, context_data.data(), 0, context_data.size() * sizeof(float));
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+    fprintf(stderr, "magpie: baked context loaded for speaker %d\n", ctx->speaker_id);
+
+    // Step 3: Initialize audio sequence with BOS tokens
+    std::vector<int32_t> audio_codes;  // [n_frames * 8]
+    for (int cb = 0; cb < hp.num_codebooks; cb++) {
+        audio_codes.push_back(hp.audio_bos_id);
+    }
+    ctx->state.n_generated_frames = 1;
+
+    // Step 4: Autoregressive loop
+    fprintf(stderr, "magpie: starting autoregressive decoding...\n");
+
+    for (int step = 0; step < hp.max_dec_steps; step++) {
+        int n_audio_frames = ctx->state.n_generated_frames;
+        int dec_seq = hp.context_frames + n_audio_frames;
+
+        // Build decoder input: [context; audio_embeddings]
+        // Compute audio embeddings for all frames
+        std::vector<float> decoder_input_data(hp.d_model * dec_seq);
+
+        // Copy context (already in [d_model, context_frames] order for GGML)
+        // context_data is flat [context_frames * d_model], needs reshape
+        // GGML expects column-major: element [d, t] at index d + t * d_model
+        for (int t = 0; t < hp.context_frames; t++) {
+            for (int d = 0; d < hp.d_model; d++) {
+                // context_data comes from get_rows which gives [first_dim, 1]
+                // The baked_context_w is stored as [flat_size, num_speakers]
+                // So context_data is flat [d_model * context_frames]
+                // PyTorch stores as (T, D), so element [t, d] is at index t * D + d
+                // We need GGML [D, T], so element [d, t] is at index d + t * D
+                decoder_input_data[d + t * hp.d_model] = context_data[t * hp.d_model + d];
+            }
+        }
+
+        // Compute audio embeddings for each frame
+        {
+            size_t ctx_size = ggml_tensor_overhead() * 64 + 32 * 1024 * 1024;
+            struct ggml_init_params params = { ctx_size, nullptr, true };
+            struct ggml_context * ctx0 = ggml_init(params);
+
+            // For each audio frame, sum embeddings from all codebooks
+            for (int t = 0; t < n_audio_frames; t++) {
+                // Create tensor for this frame's codes
+                struct ggml_tensor * frame_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 8);
+                ggml_set_input(frame_codes);
+
+                // Build embedding sum
+                struct ggml_tensor * sum = nullptr;
+                for (int cb = 0; cb < 8; cb++) {
+                    struct ggml_tensor * cb_idx = ggml_view_1d(ctx0, frame_codes, 1, cb * sizeof(int32_t));
+                    struct ggml_tensor * emb = ggml_get_rows(ctx0, ctx->model.embeddings.audio_emb_w[cb], cb_idx);
+                    emb = ggml_reshape_1d(ctx0, emb, hp.d_model);
+                    sum = (sum == nullptr) ? emb : ggml_add(ctx0, sum, emb);
+                }
+                // Scale by 1/(num_codebooks * frame_stacking_factor) = 1/8
+                sum = ggml_scale(ctx0, sum, 1.0f / 8.0f);
+                ggml_set_name(sum, "audio_emb");
+                ggml_set_output(sum);
+
+                struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+                ggml_build_forward_expand(gf, sum);
+
+                ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+                ggml_gallocr_reserve(allocr, gf);
+                ggml_gallocr_alloc_graph(allocr, gf);
+
+                // Set frame codes
+                std::vector<int32_t> codes(8);
+                for (int cb = 0; cb < 8; cb++) {
+                    codes[cb] = audio_codes[t * 8 + cb];
+                }
+                ggml_backend_tensor_set(frame_codes, codes.data(), 0, 8 * sizeof(int32_t));
+
+                ggml_backend_graph_compute(ctx->model.backend, gf);
+
+                // Get embedding and copy to decoder input
+                std::vector<float> emb_data(hp.d_model);
+                ggml_backend_tensor_get(sum, emb_data.data(), 0, hp.d_model * sizeof(float));
+
+                int dec_t = hp.context_frames + t;
+                for (int d = 0; d < hp.d_model; d++) {
+                    decoder_input_data[d + dec_t * hp.d_model] = emb_data[d];
+                }
+
+                ggml_gallocr_free(allocr);
+            }
+            ggml_free(ctx0);
+        }
+
+        // Run decoder
+        std::vector<float> decoder_hidden(hp.d_model);
+        {
+            // Need more memory as sequence grows - scale with dec_seq
+            size_t ctx_size = ggml_tensor_overhead() * 4096 + 1024 * 1024 * 1024;  // 1GB
+            struct ggml_init_params params = { ctx_size, nullptr, true };
+            struct ggml_context * ctx0 = ggml_init(params);
+
+            // Create input tensors
+            struct ggml_tensor * dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_model, dec_seq);
+            ggml_set_name(dec_input, "dec_input");
+            ggml_set_input(dec_input);
+
+            struct ggml_tensor * enc_output = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_model, ctx->state.enc_seq_len);
+            ggml_set_name(enc_output, "enc_output");
+            ggml_set_input(enc_output);
+
+            // Build decoder
+            struct ggml_tensor * dec_out = build_full_decoder(ctx0, dec_input, enc_output,
+                                                               &ctx->model.decoder, &hp);
+            if (!dec_out) {
+                fprintf(stderr, "magpie: decoder build failed\n");
+                ggml_free(ctx0);
+                return {};
+            }
+
+            // Get last position hidden state
+            struct ggml_tensor * last_hidden = ggml_view_1d(ctx0, dec_out, hp.d_model,
+                (dec_seq - 1) * hp.d_model * sizeof(float));
+            last_hidden = ggml_cont(ctx0, last_hidden);
+            ggml_set_name(last_hidden, "last_hidden");
+            ggml_set_output(last_hidden);
+
+            struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
+            ggml_build_forward_expand(gf, last_hidden);
+
+            ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+            if (!ggml_gallocr_reserve(allocr, gf) || !ggml_gallocr_alloc_graph(allocr, gf)) {
+                fprintf(stderr, "magpie: decoder alloc failed\n");
+                ggml_gallocr_free(allocr);
+                ggml_free(ctx0);
+                return {};
+            }
+
+            // Set inputs
+            ggml_backend_tensor_set(dec_input, decoder_input_data.data(), 0,
+                                    decoder_input_data.size() * sizeof(float));
+            ggml_backend_tensor_set(enc_output, ctx->state.encoder_output.data(), 0,
+                                    ctx->state.encoder_output.size() * sizeof(float));
+
+            // Fill causal mask
+            struct ggml_tensor * mask = ggml_get_tensor(ctx0, "dec_sa_mask");
+            if (mask) {
+                std::vector<float> mask_data(dec_seq * dec_seq);
+                for (int i = 0; i < dec_seq; i++) {
+                    for (int j = 0; j < dec_seq; j++) {
+                        mask_data[i * dec_seq + j] = (j <= i) ? 0.0f : -INFINITY;
+                    }
+                }
+                ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+            }
+
+            if (ggml_backend_graph_compute(ctx->model.backend, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "magpie: decoder compute failed\n");
+                ggml_gallocr_free(allocr);
+                ggml_free(ctx0);
+                return {};
+            }
+
+            ggml_backend_tensor_get(last_hidden, decoder_hidden.data(), 0, hp.d_model * sizeof(float));
+
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+        }
+
+        // Run local transformer to sample codes for all 8 codebooks
+        std::vector<int32_t> frame_codes = magpie_local_transformer_sample_all(
+            ctx, decoder_hidden.data(), ctx->temperature, ctx->top_k);
+
+        if (frame_codes.size() != 8) {
+            fprintf(stderr, "magpie: local transformer failed\n");
+            return {};
+        }
+
+        // Debug: print first few frames' codes
+        if (step < 5 || (step % 50) == 0) {
+            fprintf(stderr, "magpie: step %d codes:", step);
+            for (int cb = 0; cb < 8; cb++) {
+                fprintf(stderr, " %d", frame_codes[cb]);
+            }
+            fprintf(stderr, "\n");
+        }
+
+        // Check for EOS
+        bool has_eos = false;
+        for (int cb = 0; cb < 8; cb++) {
+            if (frame_codes[cb] == hp.audio_eos_id) {
+                has_eos = true;
+                break;
+            }
+        }
+
+        if (has_eos && step >= 4) {  // Minimum 4 frames before EOS
+            fprintf(stderr, "magpie: EOS detected at step %d\n", step);
+            break;
+        }
+
+        // Add frame codes to sequence
+        for (int cb = 0; cb < 8; cb++) {
+            audio_codes.push_back(frame_codes[cb]);
+        }
+        ctx->state.n_generated_frames++;
+
+        if ((step + 1) % 10 == 0) {
+            fprintf(stderr, "magpie: generated %d frames...\n", ctx->state.n_generated_frames);
+        }
+    }
+
+    // Return generated codes (excluding BOS frame)
+    std::vector<int32_t> result;
+    for (size_t i = 8; i < audio_codes.size(); i++) {
+        result.push_back(audio_codes[i]);
+    }
+
+    fprintf(stderr, "magpie: synthesis complete, %d audio frames generated\n",
+            (int)(result.size() / 8));
+
+    return result;
 }
 
 // Codec functions are implemented in magpie-codec.cpp
@@ -1583,7 +2029,23 @@ ggml_tensor * magpie_get_baked_context(
     int speaker_id,
     int context_frames,
     int d_model) {
-    (void)ctx; (void)embeddings; (void)speaker_id;
-    (void)context_frames; (void)d_model;
-    return nullptr;  // TODO
+    if (!ctx || !embeddings || !embeddings->baked_context_w) {
+        return nullptr;
+    }
+
+    // baked_context_w is [num_speakers, context_frames * d_model] in GGML layout
+    // We need to extract row for speaker_id and reshape to [d_model, context_frames]
+
+    // Use ggml_get_rows to get the speaker embedding
+    struct ggml_tensor * speaker_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speaker_idx, "speaker_idx");
+    ggml_set_input(speaker_idx);
+
+    // Get row for this speaker: [context_frames * d_model]
+    struct ggml_tensor * flat_context = ggml_get_rows(ctx, embeddings->baked_context_w, speaker_idx);
+
+    // Reshape to [d_model, context_frames] for GGML (column-major)
+    struct ggml_tensor * context = ggml_reshape_2d(ctx, flat_context, d_model, context_frames);
+
+    return context;
 }
