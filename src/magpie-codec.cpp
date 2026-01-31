@@ -406,20 +406,21 @@ void magpie_codec_free(struct magpie_codec * codec) {
 struct ggml_tensor * magpie_codec_build_half_snake(
     struct ggml_context * ctx,
     struct ggml_tensor * input,       // [T, channels] - ne[0]=T, ne[1]=channels
-    struct ggml_tensor * alpha)       // [half_ch] or [1, half_ch, 1] - alpha for snake
+    struct ggml_tensor * alpha)       // [first_half_ch] - alpha for snake activation
 {
     int64_t T = input->ne[0];
     int64_t channels = input->ne[1];
-    int64_t half_ch = channels / 2;
+
+    // First half gets Snake activation, second half gets LeakyReLU
+    // Alpha tensor size determines the split point
+    int64_t first_half_ch = ggml_nelements(alpha);
+    int64_t second_half_ch = channels - first_half_ch;
 
     // Split into first and second half of channels
     // For [T, C] layout, we split on ne[1] (channels dimension)
-    // first_half: channels 0 to half_ch-1
-    // second_half: channels half_ch to channels-1
     // view_2d(src, ne0, ne1, nb1, offset)
-    // nb1 = stride between rows = channels * sizeof(float)
-    struct ggml_tensor * first_half = ggml_view_2d(ctx, input, T, half_ch, input->nb[1], 0);
-    struct ggml_tensor * second_half = ggml_view_2d(ctx, input, T, half_ch, input->nb[1], half_ch * input->nb[1]);
+    struct ggml_tensor * first_half = ggml_view_2d(ctx, input, T, first_half_ch, input->nb[1], 0);
+    struct ggml_tensor * second_half = ggml_view_2d(ctx, input, T, second_half_ch, input->nb[1], first_half_ch * input->nb[1]);
 
     // Make views contiguous to ensure proper compute graph handling
     struct ggml_tensor * first_cont = ggml_cont(ctx, first_half);
@@ -428,8 +429,8 @@ struct ggml_tensor * magpie_codec_build_half_snake(
     ggml_set_name(second_cont, "second_cont");
 
     // Snake on first half: x + (1/alpha) * sin²(alpha * x)
-    // alpha is [half_ch] or [1, half_ch, 1], reshape to [1, half_ch] for broadcast over T
-    struct ggml_tensor * alpha_bc = ggml_reshape_2d(ctx, alpha, 1, half_ch);
+    // alpha is [first_half_ch], reshape to [1, first_half_ch] for broadcast over T
+    struct ggml_tensor * alpha_bc = ggml_reshape_2d(ctx, alpha, 1, first_half_ch);
 
     // alpha * x (alpha broadcasts over T dimension)
     struct ggml_tensor * ax = ggml_mul(ctx, first_cont, alpha_bc);
@@ -497,91 +498,103 @@ struct ggml_tensor * magpie_codec_build_causal_conv1d(
     return conv_out;
 }
 
-// Depthwise ConvTranspose1D for upsampling
-// Each channel is processed independently (groups=out_ch in PyTorch)
+// Grouped ConvTranspose1D for upsampling
+// NeMo nano-codec uses groups=out_ch with in_ch = 2*out_ch
+// So each output channel is produced from 2 input channels.
 // Input/output use [T, C] layout (ne[0]=T, ne[1]=C)
+//
+// Weight: [K, 1, in_ch] where in_ch = 2*out_ch
+// For group g (0 to out_ch-1):
+//   - Uses input channels [2g, 2g+1]
+//   - Uses weight[:, 0, 2g:2g+2]
+//   - Produces output channel g
+//
+// Since GGML doesn't support grouped conv_transpose_1d, we process each group
+// by extracting the 2 input channels, applying conv_transpose, and concatenating.
 struct ggml_tensor * magpie_codec_build_conv_transpose1d(
     struct ggml_context * ctx,
     struct ggml_tensor * input,       // [T, in_ch] - ne[0]=T, ne[1]=in_ch
-    struct ggml_tensor * weight,      // [K, 1, out_ch] from GGUF (depthwise: K per channel)
+    struct ggml_tensor * weight,      // [K, 1, in_ch] from GGUF
     struct ggml_tensor * bias,        // [out_ch]
     int stride)
 {
     int64_t T = input->ne[0];
     int64_t in_ch = input->ne[1];
 
-    // For depthwise: in_ch == out_ch, weight is [K, 1, out_ch]
-    int kernel_size = weight->ne[0];
-    int out_ch = weight->ne[2];
-    GGML_ASSERT(in_ch == out_ch);  // Depthwise: same input/output channels
+    // Weight is [K, 1, in_ch]
+    int64_t K = weight->ne[0];
+    int64_t w_in_ch = weight->ne[2];
+    GGML_ASSERT(in_ch == w_in_ch);
 
-    // ConvTranspose1d output length: (T - 1) * stride + kernel_size
-    int64_t out_T = (T - 1) * stride + kernel_size;
+    // For groups=out_ch with in_ch=2*out_ch: 2 input channels per output channel
+    int64_t in_per_group = 2;
+    int64_t out_ch = in_ch / in_per_group;
+
+    // ConvTranspose1d output length: (T - 1) * stride + K
+    int64_t out_T = (T - 1) * stride + K;
 
     // Trimming for causal: trim right by (kernel_size - stride)
-    int padding_right = kernel_size - stride;
-    int64_t final_T = out_T - padding_right;  // Should be T * stride
+    int64_t trim_right = K - stride;
+    int64_t final_T = out_T - trim_right;  // Should be T * stride
 
-    // Create output tensor [final_T, out_ch]
-    struct ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, final_T, out_ch);
-    ggml_set_name(output, "conv_transpose_out");
+    // Process each group (output channel)
+    // For group g:
+    //   - Extract input [T, 2] for channels [2g, 2g+1]
+    //   - Extract weight [K, 1, 2] for those channels
+    //   - Apply conv_transpose with IC=2, OC=1
+    //   - Output is [final_T, 1]
 
-    // For depthwise transposed convolution:
-    // For each output time t and channel c:
-    //   output[t, c] = sum over k: weight[k, 0, c] * input[(t - (K-1-k)*dilation) / stride, c]
-    //                  where (t - (K-1-k)*dilation) mod stride == 0
-    //
-    // Equivalently: scatter input values at strided positions, then convolve
-    // Since GGML doesn't have scatter, we implement using upscale + conv
-    //
-    // Strategy: Use ggml_upscale to insert zeros, then use grouped 1D conv
-    // But GGML doesn't have grouped conv either...
-    //
-    // Alternative: Use the relationship between conv_transpose and regular conv
-    // conv_transpose can be expressed as: upsample -> pad -> conv
-    //
-    // For now: implement element-wise in a custom op or use available ops creatively
-    //
-    // Simplest approach for groups=out_ch:
-    // Reshape input to [T, 1, out_ch], weight to [K, 1, out_ch]
-    // Use ggml_repeat to create strided positions
-    // Then use element-wise multiply and sum
+    struct ggml_tensor * output = nullptr;
 
-    // Actually, let's use the simpler approach:
-    // 1. Upscale input by stride (insert stride-1 zeros between each sample)
-    // 2. Apply regular conv (but GGML conv doesn't support groups)
-    //
-    // For depthwise, we can use element-wise ops:
-    // Reshape and use mul + reduce
+    for (int64_t g = 0; g < out_ch; g++) {
+        // Extract 2 input channels for this group: [T, 2]
+        struct ggml_tensor * in_g = ggml_view_2d(ctx, input, T, in_per_group,
+                                                  input->nb[1],
+                                                  g * in_per_group * input->nb[1]);
+        in_g = ggml_cont(ctx, in_g);
 
-    // Implementation using ggml_im2col + matmul pattern would be complex
-    // For now, let's create a simple version that may be slow but correct
+        // Extract weight for this group: [K, 1, 2]
+        // weight layout: ne[0]=K, ne[1]=1, ne[2]=in_ch
+        struct ggml_tensor * w_g = ggml_view_3d(ctx, weight, K, 1, in_per_group,
+                                                 weight->nb[1], weight->nb[2],
+                                                 g * in_per_group * weight->nb[2]);
+        w_g = ggml_cont(ctx, w_g);
 
-    // Create upsampled input with zeros: [T, C] -> [T*stride, C]
-    // We'll fill non-zero positions in compute phase
+        // ggml_conv_transpose_1d expects:
+        //   kernel: [K, OC, IC] where ne[0]=K, ne[1]=OC, ne[2]=IC
+        //   input:  [T, IC] where ne[0]=T, ne[1]=IC
+        //   output: [T', OC]
+        //
+        // Our extracted w_g is [K, 1, 2] = [K, OC=1, IC=2]
+        // This is already the correct format - no permute needed!
+        //
+        // Apply conv_transpose_1d: [T, 2] with kernel [K, 1, 2] -> [out_T, 1]
+        struct ggml_tensor * out_g = ggml_conv_transpose_1d(ctx, w_g, in_g, stride, 0, 1);
 
-    // Actually, for simplicity let's just pad and use what we have
-    // This is a placeholder - proper implementation needs custom CUDA kernel
-    // or clever use of existing ops
+        // Trim right side for causality: [out_T, 1] -> [final_T, 1]
+        if (trim_right > 0) {
+            out_g = ggml_view_2d(ctx, out_g, final_T, 1, out_g->nb[1], 0);
+            out_g = ggml_cont(ctx, out_g);
+        }
 
-    // For testing: use a pass-through that at least preserves the shape
-    // TODO: Implement proper depthwise conv_transpose
-
-    // Fallback: create a placeholder tensor with correct shape
-    // TODO: Implement proper depthwise conv_transpose
-    // Options: 1) custom CUDA kernel, 2) decompose into scatter+conv, 3) CPU fallback
-    struct ggml_tensor * upscaled = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, final_T, out_ch);
-    ggml_set_name(upscaled, "upscale_todo");
-    ggml_set_input(upscaled);  // Mark as input so it gets allocated
-
-    // Add bias if present
-    if (bias && ggml_nelements(bias) > 0) {
-        struct ggml_tensor * bias_2d = ggml_reshape_2d(ctx, bias, 1, ggml_nelements(bias));
-        struct ggml_tensor * bias_bc = ggml_repeat(ctx, bias_2d, upscaled);
-        upscaled = ggml_add(ctx, upscaled, bias_bc);
+        // Concatenate groups: [final_T, 1] * out_ch -> [final_T, out_ch]
+        if (output == nullptr) {
+            output = out_g;
+        } else {
+            output = ggml_concat(ctx, output, out_g, 1);
+        }
     }
 
-    return upscaled;
+    ggml_set_name(output, "conv_transpose_out");
+
+    // Add bias: [out_ch] broadcast to [final_T, out_ch]
+    if (bias && ggml_nelements(bias) > 0) {
+        struct ggml_tensor * bias_2d = ggml_reshape_2d(ctx, bias, 1, out_ch);
+        struct ggml_tensor * bias_bc = ggml_repeat(ctx, bias_2d, output);
+        output = ggml_add(ctx, output, bias_bc);
+    }
+
+    return output;
 }
 
 // Single residual block
@@ -695,12 +708,12 @@ struct ggml_tensor * magpie_codec_build_fsq_dequant(
 // Full decoder graph
 struct ggml_tensor * magpie_codec_build_decoder(
     struct ggml_context * ctx,
-    struct ggml_tensor * latent,      // [latent_dim, T]
+    struct ggml_tensor * latent,      // [T, latent_dim] GGML layout (ne[0]=T, ne[1]=C)
     struct magpie_codec * codec)
 {
     struct ggml_tensor * out = latent;
 
-    // Pre-conv: [latent_dim, T] -> [base_ch, T]
+    // Pre-conv: [T, latent_dim] -> [T, base_ch]
     out = magpie_codec_build_causal_conv1d(ctx, out, codec->pre_conv_w, codec->pre_conv_b, 1);
 
     // Upsample stages
@@ -797,8 +810,9 @@ std::vector<float> magpie_codec_decode(
     fsq_dequantize_cpu(codes, latent_data.data(), num_cb, n_frames);
 
     // Step 2: Build compute graph
+    // Need large memory for the extensive per-channel operations
     struct ggml_init_params params = {
-        .mem_size   = 256 * 1024 * 1024,  // 256 MB for graph
+        .mem_size   = 1024 * 1024 * 1024,  // 1 GB for graph
         .mem_buffer = nullptr,
         .no_alloc   = true,
     };
@@ -820,8 +834,9 @@ std::vector<float> magpie_codec_decode(
     ggml_set_name(audio, "audio_output");
     ggml_set_output(audio);
 
-    // Create compute graph
-    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    // Create compute graph with large capacity
+    // The graph is very large due to per-channel conv_transpose operations
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 131072, false);
     ggml_build_forward_expand(gf, audio);
 
     // Allocate tensors
