@@ -1568,28 +1568,7 @@ std::vector<int32_t> magpie_synthesize_codes(
     return {};  // TODO
 }
 
-magpie_codec * magpie_codec_init(const char * codec_path) {
-    (void)codec_path;
-    return nullptr;  // TODO
-}
-
-magpie_codec * magpie_codec_init_with_backend(const char * codec_path, magpie_backend_type backend) {
-    (void)codec_path; (void)backend;
-    return nullptr;  // TODO
-}
-
-void magpie_codec_free(magpie_codec * codec) {
-    (void)codec;
-    // TODO
-}
-
-std::vector<float> magpie_codec_decode(
-    magpie_codec * codec,
-    const int32_t * codes,
-    int n_frames) {
-    (void)codec; (void)codes; (void)n_frames;
-    return {};  // TODO
-}
+// Codec functions are implemented in magpie-codec.cpp
 
 bool magpie_is_eos(const std::vector<int32_t> & frame_codes, int32_t eos_id) {
     for (int32_t code : frame_codes) {

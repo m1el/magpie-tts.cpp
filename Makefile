@@ -38,7 +38,7 @@ ifeq ($(METAL_AVAILABLE),1)
 endif
 
 # Source files
-SRCS = src/magpie.cpp
+SRCS = src/magpie.cpp src/magpie-codec.cpp
 
 .PHONY: all clean check-header
 
@@ -106,6 +106,18 @@ test_final_proj: tests/test_final_proj.cpp $(SRCS)
 
 # Test local transformer
 test_local_transformer: tests/test_local_transformer.cpp $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+# Test codec loading
+test_codec_load: tests/test_codec_load.cpp $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+# Test codec FSQ dequantization
+test_codec_fsq: tests/test_codec_fsq.cpp $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+# Test codec decoder
+test_codec_decode: tests/test_codec_decode.cpp $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:

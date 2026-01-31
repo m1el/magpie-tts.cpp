@@ -107,6 +107,30 @@ def convert_codec_to_gguf(
     current_offset = 0
     total_bytes = 0
 
+    def shorten_name(name):
+        """Shorten tensor names to fit GGML's 64 char limit."""
+        # Abbreviations for common patterns
+        replacements = [
+            ('audio_decoder.', 'dec.'),
+            ('vector_quantizer.', 'vq.'),
+            ('.res_layers.', '.rl.'),
+            ('.res_blocks.', '.rb.'),
+            ('.up_sample_conv_layers.', '.up.'),
+            ('.activations.', '.act.'),
+            ('.input_activation.activation.snake_act.', '.in_act.'),
+            ('.skip_activation.activation.snake_act.', '.sk_act.'),
+            ('.input_conv.conv.', '.in_conv.'),
+            ('.skip_conv.conv.', '.sk_conv.'),
+            ('.post_activation.activation.snake_act.', '.post_act.'),
+            ('.pre_conv.conv.', '.pre.'),
+            ('.post_conv.conv.', '.post.'),
+            ('.conv.', '.c.'),
+        ]
+        result = name
+        for old, new in replacements:
+            result = result.replace(old, new)
+        return result
+
     for name, data in sorted(tensors.items()):
         # Convert weight normalization params to combined weights
         # PyTorch stores: original0 (g), original1 (v)
@@ -125,12 +149,13 @@ def convert_codec_to_gguf(
         else:
             tensor_data = data.astype(np.float32).tobytes()
 
-        print(f"  {name}: {data.shape} {data.dtype}")
+        short_name = shorten_name(name)
+        print(f"  {short_name}: {data.shape} {data.dtype}")
 
         aligned_offset = (current_offset + GGUF_DEFAULT_ALIGNMENT - 1) // GGUF_DEFAULT_ALIGNMENT * GGUF_DEFAULT_ALIGNMENT
 
         tensor_infos.append({
-            'name': name,
+            'name': short_name,
             'shape': shape_gguf[:4],
             'n_dims': len(data.shape),
             'type': tensor_type,
@@ -167,6 +192,7 @@ def convert_codec_to_gguf(
             weight = g * v / v_norm
 
             name = base + '.weight'
+            short_name = shorten_name(name)
 
             shape_gguf = list(reversed(weight.shape))
             while len(shape_gguf) < 4:
@@ -178,12 +204,12 @@ def convert_codec_to_gguf(
             else:
                 tensor_data = weight.astype(np.float32).tobytes()
 
-            print(f"  {name}: {weight.shape} (combined from weight_norm)")
+            print(f"  {short_name}: {weight.shape} (combined from weight_norm)")
 
             aligned_offset = (current_offset + GGUF_DEFAULT_ALIGNMENT - 1) // GGUF_DEFAULT_ALIGNMENT * GGUF_DEFAULT_ALIGNMENT
 
             tensor_infos.append({
-                'name': name,
+                'name': short_name,
                 'shape': shape_gguf[:4],
                 'n_dims': len(weight.shape),
                 'type': tensor_type,

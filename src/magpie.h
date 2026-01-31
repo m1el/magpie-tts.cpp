@@ -484,21 +484,95 @@ std::vector<int32_t> magpie_synthesize_codes(
 // Audio Codec (separate model)
 //
 
+// Codec hyperparameters
+struct magpie_codec_hparams {
+    int32_t sample_rate     = 22050;
+    int32_t num_codebooks   = 8;
+    int32_t codebook_size   = 2016;
+    int32_t hop_length      = 1024;
+    int32_t latent_dim      = 32;    // 8 codebooks * 4 dims per cb
+
+    // FSQ levels per codebook (same for all 8)
+    int32_t fsq_levels[4]   = {8, 7, 6, 6};
+
+    // HiFiGAN decoder structure
+    int32_t pre_conv_kernel     = 7;
+    int32_t post_conv_kernel    = 3;
+    int32_t base_channels       = 864;
+
+    // Upsample rates: 8, 8, 4, 2, 2 (product = 1024 = hop_length)
+    int32_t num_upsample_layers = 5;
+    int32_t up_sample_rates[5]  = {8, 8, 4, 2, 2};
+    int32_t up_channels[5]      = {432, 216, 108, 54, 27};  // out channels
+
+    // Residual block structure
+    int32_t resblock_kernel_sizes[3] = {3, 7, 11};
+    int32_t resblock_dilations[3]    = {1, 3, 5};
+};
+
+// Single residual block weights
+struct magpie_codec_resblock {
+    struct ggml_tensor * input_act_alpha;   // [1, ch/2, 1] HalfSnake alpha
+    struct ggml_tensor * input_conv_w;      // [out_ch, in_ch, kernel]
+    struct ggml_tensor * input_conv_b;      // [out_ch]
+    struct ggml_tensor * skip_act_alpha;    // [1, ch/2, 1] HalfSnake alpha
+    struct ggml_tensor * skip_conv_w;       // [out_ch, in_ch, kernel]
+    struct ggml_tensor * skip_conv_b;       // [out_ch]
+};
+
+// HiFiGAN residual block (3 inner blocks with different dilations)
+struct magpie_codec_hifigan_resblock {
+    std::vector<magpie_codec_resblock> inner_blocks;  // [3] for dilations 1,3,5
+};
+
+// HiFiGAN residual layer (3 blocks with different kernels, averaged)
+struct magpie_codec_reslayer {
+    std::vector<magpie_codec_hifigan_resblock> res_blocks;  // [3] for kernels 3,7,11
+};
+
+// Upsample stage
+struct magpie_codec_upsample {
+    struct ggml_tensor * act_alpha;     // [1, in_ch/2, 1] HalfSnake alpha
+    struct ggml_tensor * conv_w;        // [out_ch, 1, kernel] (groups=out_ch)
+    struct ggml_tensor * conv_b;        // [out_ch]
+};
+
+// FSQ quantizer (parameters only, decode is formula-based)
+struct magpie_codec_fsq {
+    struct ggml_tensor * dim_base_index;  // [1, 4, 1] = {1, 8, 56, 336}
+    struct ggml_tensor * num_levels;      // [1, 4, 1] = {8, 7, 6, 6}
+};
+
+// Full codec structure
 struct magpie_codec {
-    // Hyperparameters
-    int32_t latent_dim;
-    int32_t num_codebooks;
-    int32_t hop_length;
+    magpie_codec_hparams hparams;
 
-    // FSQ parameters (no learned codebook, uses formula)
-    int32_t fsq_levels[4];  // per-dimension quantization levels
+    // Pre-conv: latent_dim -> base_channels
+    struct ggml_tensor * pre_conv_w;    // [base_ch, latent_dim, kernel]
+    struct ggml_tensor * pre_conv_b;    // [base_ch]
 
-    // HiFiGAN decoder weights
-    // ... (defined in magpie-codec.h)
+    // Upsample layers (5 stages)
+    std::vector<magpie_codec_upsample> upsample_layers;  // [5]
 
+    // Residual layers (5 stages, one per upsample)
+    std::vector<magpie_codec_reslayer> res_layers;  // [5]
+
+    // Post-conv: final_ch -> 1
+    struct ggml_tensor * post_act_alpha;  // [1, final_ch/2, 1]
+    struct ggml_tensor * post_conv_w;     // [1, final_ch, kernel]
+    struct ggml_tensor * post_conv_b;     // [1]
+
+    // FSQ parameters (8 codebooks)
+    std::vector<magpie_codec_fsq> fsqs;  // [8]
+
+    // GGML contexts and backends
     struct ggml_context * ctx_w;
     ggml_backend_t backend;
     ggml_backend_buffer_t buffer_w;
+    magpie_backend_type backend_type;
+
+    // Tensor name mapping
+    std::map<std::string, struct ggml_tensor *> tensors;
 };
 
 // Initialize audio codec
@@ -508,11 +582,71 @@ struct magpie_codec * magpie_codec_init_with_backend(const char * codec_path, ma
 // Free codec
 void magpie_codec_free(struct magpie_codec * codec);
 
+// Load codec weights from GGUF file
+bool magpie_codec_load(const std::string & path, magpie_codec & codec, magpie_backend_type backend = MAGPIE_BACKEND_AUTO);
+
 // Decode audio codes to waveform
 std::vector<float> magpie_codec_decode(
     struct magpie_codec * codec,
     const int32_t * codes,  // [num_codebooks, n_frames]
     int n_frames);
+
+//
+// Codec Graph Building Functions
+//
+
+// Build FSQ dequantization: codes [num_cb, T] -> latent [latent_dim, T]
+struct ggml_tensor * magpie_codec_build_fsq_dequant(
+    struct ggml_context * ctx,
+    struct ggml_tensor * codes,       // [num_codebooks, n_frames] int32
+    struct magpie_codec * codec);
+
+// Build HalfSnake activation: x + (1/alpha) * sin²(alpha * x) on first half, LeakyReLU on second
+struct ggml_tensor * magpie_codec_build_half_snake(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,       // [channels, T]
+    struct ggml_tensor * alpha);      // [1, channels/2, 1]
+
+// Build causal conv1d with left padding
+struct ggml_tensor * magpie_codec_build_causal_conv1d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,       // [in_ch, T]
+    struct ggml_tensor * weight,      // [out_ch, in_ch, kernel]
+    struct ggml_tensor * bias,        // [out_ch]
+    int dilation = 1);
+
+// Build causal conv transpose 1d (upsample)
+struct ggml_tensor * magpie_codec_build_conv_transpose1d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,       // [in_ch, T]
+    struct ggml_tensor * weight,      // [out_ch, 1, kernel] (groups=out_ch means depthwise)
+    struct ggml_tensor * bias,        // [out_ch]
+    int stride);
+
+// Build single residual block
+struct ggml_tensor * magpie_codec_build_residual_block(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct magpie_codec_resblock * block,
+    int dilation);
+
+// Build HiFiGAN residual block (3 inner blocks)
+struct ggml_tensor * magpie_codec_build_hifigan_resblock(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct magpie_codec_hifigan_resblock * block);
+
+// Build HiFiGAN residual layer (3 blocks averaged)
+struct ggml_tensor * magpie_codec_build_reslayer(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct magpie_codec_reslayer * layer);
+
+// Build full HiFiGAN decoder graph
+struct ggml_tensor * magpie_codec_build_decoder(
+    struct ggml_context * ctx,
+    struct ggml_tensor * latent,      // [latent_dim, T]
+    struct magpie_codec * codec);
 
 //
 // Utility Functions
