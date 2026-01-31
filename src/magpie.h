@@ -387,6 +387,23 @@ struct ggml_tensor * magpie_build_decoder_layer(
     struct magpie_kv_cache * kv_cache,
     const magpie_hparams * hparams);
 
+// Build single-step cached decoder layer for autoregressive generation
+// Uses KV cache for self-attention, pre-cached K/V for cross-attention
+struct ggml_tensor * magpie_build_decoder_layer_cached(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,           // [d_model, 1] - current step
+    struct ggml_tensor * xa_k_cached,     // [d_xa_head * n_xa_heads, enc_seq]
+    struct ggml_tensor * xa_v_cached,     // [d_xa_head * n_xa_heads, enc_seq]
+    struct ggml_tensor * sa_k_cache_in,   // [d_model, cache_len] or nullptr for first step
+    struct ggml_tensor * sa_v_cache_in,   // [d_model, cache_len] or nullptr
+    int layer_idx,
+    struct magpie_decoder_layer * layer,
+    const magpie_hparams * hparams,
+    int pos_offset,                       // position offset for positional embeddings
+    struct ggml_tensor * pos_emb_w,       // [d_model, max_seq]
+    struct ggml_tensor ** sa_k_cache_out, // output: updated K cache
+    struct ggml_tensor ** sa_v_cache_out);// output: updated V cache
+
 // Build RMS norm (legacy - prefer layer_norm)
 struct ggml_tensor * magpie_build_rms_norm(
     struct ggml_context * ctx,
@@ -427,6 +444,43 @@ struct ggml_tensor * magpie_build_self_attention_with_mask(
     int n_heads,
     bool is_causal,
     struct ggml_tensor * shared_mask);  // pre-created F16 causal mask, or nullptr
+
+// Build self-attention with KV cache (for autoregressive decoding)
+// Processes a single step, using cached K/V from previous steps
+// k_cache_in/v_cache_in: [d_model, cache_len] or nullptr for first step
+// k_cache_out/v_cache_out: [d_model, cache_len + 1] updated cache
+struct ggml_tensor * magpie_build_self_attention_cached(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,       // [d_model, 1] - single step
+    struct ggml_tensor * qkv_weight,  // [3*d_model, d_model]
+    struct ggml_tensor * out_weight,  // [d_model, d_model]
+    struct ggml_tensor * k_cache_in,  // [d_model, cache_len] or nullptr
+    struct ggml_tensor * v_cache_in,  // [d_model, cache_len] or nullptr
+    int n_heads,
+    struct ggml_tensor ** k_cache_out,  // output: [d_model, cache_len + 1]
+    struct ggml_tensor ** v_cache_out); // output: [d_model, cache_len + 1]
+
+// Build cross-attention with pre-cached K/V from encoder
+// K/V are precomputed from encoder output and cached
+struct ggml_tensor * magpie_build_cross_attention_cached(
+    struct ggml_context * ctx,
+    struct ggml_tensor * query,       // [d_model, 1] - decoder current step
+    struct ggml_tensor * k_cached,    // [d_xa_head * n_xa_heads, enc_seq] - pre-computed K
+    struct ggml_tensor * v_cached,    // [d_xa_head * n_xa_heads, enc_seq] - pre-computed V
+    struct ggml_tensor * q_weight,    // [d_xa_head * n_xa_heads, d_model]
+    struct ggml_tensor * out_weight,  // [d_model, d_xa_head * n_xa_heads]
+    int n_heads,
+    int d_head);
+
+// Precompute cross-attention K/V from encoder output (call once per utterance)
+void magpie_precompute_cross_attention_kv(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,  // [d_model, enc_seq]
+    struct ggml_tensor * kv_weight,    // [2 * d_xa_head * n_xa_heads, d_model]
+    struct ggml_tensor * norm_mem_w,   // [d_model] memory norm weight
+    float eps,
+    struct ggml_tensor ** k_out,       // output: [d_xa_head * n_xa_heads, enc_seq]
+    struct ggml_tensor ** v_out);      // output: [d_xa_head * n_xa_heads, enc_seq]
 
 // Build conv-based feed-forward network
 struct ggml_tensor * magpie_build_conv_ffn(
@@ -476,6 +530,12 @@ std::vector<int32_t> magpie_sample_frame(
 
 // Full synthesis: text tokens -> audio codes
 std::vector<int32_t> magpie_synthesize_codes(
+    struct magpie_context * ctx,
+    const int32_t * tokens,
+    int n_tokens);
+
+// Optimized synthesis using KV cache (O(n) per step instead of O(n²))
+std::vector<int32_t> magpie_synthesize_codes_cached(
     struct magpie_context * ctx,
     const int32_t * tokens,
     int n_tokens);

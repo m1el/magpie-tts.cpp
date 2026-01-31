@@ -213,7 +213,13 @@ First frame codes match PyTorch exactly: [293, 1454, 512, 1455, 476, 40, 1817, 1
 - First 3 codes of frame 0 now match: `285 1455 512` (vs PyTorch `285 1455 512 ...`)
 
 ### Next Steps (Optimization)
-1. **KV cache for decoder** - Currently recomputes full sequence each step (O(n²) memory)
+1. **KV cache for decoder** - ⚠️ Initial implementation complete, needs debugging
+   - `magpie_synthesize_codes_cached()` implemented with single-step decoder
+   - Cross-attention K/V pre-computed once from encoder output
+   - Self-attention K/V cached and updated per step
+   - **Issue**: Produces different outputs than uncached version (codes differ from first frame)
+   - **Issue**: Currently slower than uncached due to per-step graph creation overhead
+   - **Next**: Debug position embedding handling, optimize graph reuse
 2. **EOS detection tuning** - Model doesn't generate EOS reliably yet
 3. **Temperature sampling** - Currently using argmax, should add temperature/top-k
 4. **Streaming support** - Incremental decoding for real-time TTS
@@ -454,6 +460,8 @@ make test_full_encoder_v2 test_full_decoder test_final_proj test_local_transform
 ./test_codec_fsq         # FSQ dequantization: exact match
 ./test_codec_decode      # Full codec decoder: max diff 0.004
 ./test_e2e_inference     # Full pipeline: text tokens → output.wav
+./test_e2e_cached        # KV-cached pipeline (WIP)
+./test_e2e_cached --compare  # Compare cached vs uncached performance
 
 # Generate reference data (if needed)
 uv run scripts/dump_reference.py --text "Hello world" --output-dir test_data/reference

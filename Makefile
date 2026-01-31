@@ -124,5 +124,9 @@ test_codec_decode: tests/test_codec_decode.cpp $(SRCS)
 test_e2e_inference: tests/test_e2e_inference.cpp $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
+# Test end-to-end inference with KV cache (optimized)
+test_e2e_cached: tests/test_e2e_cached.cpp $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
 clean:
 	rm -f magpie-tts test_load test_text_embedding test_audio_embedding test_rms_norm test_encoder_layer test_self_attention test_conv_ffn test_full_encoder
