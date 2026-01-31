@@ -123,13 +123,48 @@ Key implementation details:
 
 The full local transformer now matches PyTorch with exact accuracy for all 8 codebooks!
 
+### Completed Implementation Steps (Audio Codec)
+17. ✅ **Implement FSQ dequantization** - `fsq_dequantize_cpu()` for codebook indices to continuous values
+    - 8 codebooks × 4 dims per codebook = 32 latent dimensions
+    - levels = [8, 7, 6, 6], formula: code = (nonneg - L/2) / (L/2)
+    - Tested against `test_data/reference/codec/codec_latent.bin` - **EXACT MATCH (max diff: 0.0)**
+    - Test: `./test_codec_fsq`
+18. ✅ **Implement CausalConv1d** - `magpie_codec_build_causal_conv1d()` with left padding
+    - Left-pad by (kernel_size - 1) × dilation for causality
+    - Tested pre-conv layer - PASS (max diff: 0.001252)
+19. ✅ **Implement HalfSnake activation** - `magpie_codec_build_half_snake()`
+    - First half: Snake activation x + (1/α) × sin²(αx)
+    - Second half: LeakyReLU (slope=0.01)
+    - Fixed handling of odd channel counts (e.g., 27 → 13+14 split)
+    - Tested against reference - PASS (max diff: 0.001177)
+20. ✅ **Implement grouped ConvTranspose1d** - `magpie_codec_build_conv_transpose1d()`
+    - NeMo uses groups=out_ch with in_ch=2×out_ch (not true depthwise)
+    - GGML doesn't support grouped conv_transpose, implemented per-group
+    - Tested upsample layer 0 - PASS (max diff: 0.000000)
+21. ✅ **Implement HiFiGAN residual blocks** - 3 blocks with kernels [3, 7, 11], averaged
+    - Each block has 3 inner blocks with dilations [1, 3, 5]
+    - Tested residual layer 0 - PASS (max diff: 0.006206)
+22. ✅ **Full codec decoder** - 5 upsample stages, complete pipeline
+    - Pre-conv → 5 × (HalfSnake → Upsample → ResLayer) → Post-act → Post-conv → Tanh
+    - Tested end-to-end - **PASS (max diff: 0.004516)**
+    - Test: `./test_codec_decode`
+
+### AUDIO CODEC COMPLETE ✅
+
+The full HiFiGAN audio codec decoder now matches PyTorch with excellent accuracy:
+- **FSQ dequantization: EXACT MATCH (0.0)**
+- **Full decoder: max diff 0.004516, within 0.05 tolerance**
+
+Key implementation details:
+- Grouped ConvTranspose requires per-group processing (432 groups for first upsample)
+- Graph needs 131072 nodes capacity for many per-channel operations
+- HalfSnake split must use alpha tensor size, not channels/2 (handles odd channels)
+
 ### Next Steps
 1. **Full end-to-end inference pipeline** - Combine all components:
-   - Tokenize text → Text encoder → Decoder (autoregressive) → Local transformer → Codes
-2. **Integrate audio codec** - HiFiGAN decoder for codes -> waveform (~290 tensors)
-   - Snake activations, residual blocks, upsample layers
-   - Can use PyTorch codec in the meantime for audio decoding
-3. **Optimization** - KV cache for decoder, batching
+   - Tokenize text → Text encoder → Decoder (autoregressive) → Local transformer → Codes → Audio
+2. **Optimization** - KV cache for decoder, batching
+3. **Streaming support** - Incremental decoding for real-time TTS
 
 ### Architecture Summary
 
@@ -191,8 +226,8 @@ Text Input
          │
          ▼
 ┌────────────────────┐
-│ Audio Codec        │  ⏳ TODO (~290 tensors)
-│ (HiFiGAN Decoder)  │  (can use PyTorch decoder)
+│ Audio Codec        │  ✅ GGML (306 tensors, max diff: 0.004)
+│ (HiFiGAN Decoder)  │
 └─────────┬──────────┘
           │
           ▼
@@ -318,43 +353,50 @@ uv run inspect_inference.py --save-audio
 ## Resume Prompt (2026-01-31)
 
 ```
-Continue the Magpie TTS GGML port. Text-to-codes pipeline is COMPLETE!
+Continue the Magpie TTS GGML port. FULL PIPELINE COMPLETE!
 
-STATUS:
+STATUS - ALL COMPONENTS VERIFIED:
 - Full 6-layer encoder: max diff 0.008 vs PyTorch ✅
 - Full 12-layer decoder: max diff 0.003 vs PyTorch ✅
 - Final projection: max diff 0.000001 vs PyTorch ✅
 - Local transformer: EXACT MATCH for all 8 codebooks ✅
+- Audio codec (HiFiGAN): max diff 0.004 vs PyTorch ✅
 
 VERIFIED TESTS:
 - ./test_full_encoder_v2 (Full encoder: 0.008 max diff)
 - ./test_full_decoder (Full decoder: 0.003 max diff)
 - ./test_final_proj (Final projection: 0.000001 max diff)
 - ./test_local_transformer (All 8 codebooks match exactly)
+- ./test_codec_fsq (FSQ dequantization: exact match)
+- ./test_codec_decode (Full codec: 0.004 max diff)
 
 REMAINING:
-1. Audio codec (HiFiGAN decoder) - ~290 tensors, converts codes to waveform
-2. End-to-end inference pipeline
-3. KV cache optimization
+1. End-to-end inference pipeline (combine all components)
+2. KV cache optimization
+3. Streaming/real-time support
 
 KEY FILES:
-- src/magpie.cpp, src/magpie.h - main implementation
-- scripts/dump_local_transformer_reference.py - generates LT reference data
+- src/magpie.cpp, src/magpie.h - main TTS model implementation
+- src/magpie-codec.cpp - audio codec implementation
+- scripts/inspect_codec.py - generates codec reference data
 - test_data/reference/ - PyTorch reference tensors (column-major format)
 ```
 
 ## Quick Test Commands
 ```bash
 # Run all key tests
-make test_full_encoder_v2 test_full_decoder test_final_proj test_local_transformer
+make test_full_encoder_v2 test_full_decoder test_final_proj test_local_transformer test_codec_fsq test_codec_decode
 
 ./test_full_encoder_v2   # Encoder: 6 layers, max diff 0.008
 ./test_full_decoder      # Decoder: 12 layers, max diff 0.003
 ./test_final_proj        # Final projection: max diff 0.000001
 ./test_local_transformer # Local transformer: exact match all 8 codebooks
+./test_codec_fsq         # FSQ dequantization: exact match
+./test_codec_decode      # Full codec decoder: max diff 0.004
 
 # Generate reference data (if needed)
 uv run scripts/dump_reference.py --text "Hello world" --output-dir test_data/reference
 uv run scripts/dump_decoder_reference.py
 uv run scripts/dump_local_transformer_reference.py
+uv run scripts/inspect_codec.py --num-frames 5  # Codec reference data
 ```
