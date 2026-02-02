@@ -4,11 +4,11 @@
 *.so
 *.dylib
 
-# Test binaries
-test_*
-debug_*
-check_*
-magpie-tts
+# Test binaries (in root directory only)
+/test_*
+/debug_*
+/check_*
+/magpie-tts
 
 # Generated data (large files)
 weights/
