@@ -586,6 +586,67 @@ std::vector<int32_t> magpie_synthesize_codes_optimized(
     const int32_t * tokens,
     int n_tokens);
 
+// Graph-reuse optimized synthesis (fastest)
+// - Batched context processing (110 frames in 1 graph)
+// - Persistent allocator reuse across autoregressive steps
+std::vector<int32_t> magpie_synthesize_codes_graph_reuse(
+    struct magpie_context * ctx,
+    const int32_t * tokens,
+    int n_tokens);
+
+//
+// Streaming TTS API
+//
+
+// Callback for streaming audio chunks
+// Called with audio samples as they become available
+// Return false to stop generation
+typedef bool (*magpie_audio_callback)(
+    const float * samples,    // Audio samples (mono, 22050 Hz)
+    int n_samples,            // Number of samples in this chunk
+    void * user_data          // User-provided context
+);
+
+// Callback for streaming progress/status
+typedef void (*magpie_progress_callback)(
+    int frames_generated,     // Total frames generated so far
+    int sentence_index,       // Current sentence being processed (0-based)
+    int total_sentences,      // Total number of sentences
+    void * user_data
+);
+
+// Streaming synthesis parameters
+struct magpie_stream_params {
+    float temperature = 0.7f;
+    int top_k = 80;
+    int speaker_id = 0;
+    int frames_per_chunk = 4;        // Frames to batch before decoding (latency vs efficiency)
+    bool sentence_chunking = true;   // Split text at sentence boundaries
+    magpie_audio_callback on_audio = nullptr;
+    magpie_progress_callback on_progress = nullptr;
+    void * user_data = nullptr;
+};
+
+// Split text into sentences for streaming
+std::vector<std::string> magpie_split_sentences(const char * text);
+
+// Streaming synthesis - generates audio and calls callbacks as chunks are ready
+// Returns total number of audio samples generated, or -1 on error
+int magpie_synthesize_streaming(
+    struct magpie_context * ctx,
+    struct magpie_codec * codec,
+    const char * text,
+    const magpie_stream_params & params);
+
+// Lower-level streaming: synthesize a single sentence, calling callbacks
+// Useful for custom sentence handling
+int magpie_synthesize_sentence_streaming(
+    struct magpie_context * ctx,
+    struct magpie_codec * codec,
+    const int32_t * tokens,
+    int n_tokens,
+    const magpie_stream_params & params);
+
 //
 // Audio Codec (separate model)
 //

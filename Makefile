@@ -136,5 +136,9 @@ test_e2e_optimized: tests/test_e2e_optimized.cpp $(SRCS)
 test_streaming: tests/test_streaming.cpp $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
+# Test graph-reuse optimized inference (batched context + allocator reuse)
+test_graph_reuse: tests/test_graph_reuse.cpp $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
 clean:
 	rm -f magpie-tts test_load test_text_embedding test_audio_embedding test_rms_norm test_encoder_layer test_self_attention test_conv_ffn test_full_encoder

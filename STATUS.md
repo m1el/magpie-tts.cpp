@@ -223,11 +223,16 @@ First frame codes match PyTorch exactly: [293, 1454, 512, 1455, 476, 40, 1817, 1
 
 ### KV Cache Performance Results
 
-| Version | Time (50 frames) | Speed (fps) | Notes |
-|---------|------------------|-------------|-------|
-| GPU-Optimized | 0.96s | 52.3 | New GPU-resident cache |
-| Uncached | 0.90s | 55.6 | Full decoder each step |
-| Old Cached | 2.21s | 22.6 | CPU↔GPU round-trips |
+| Version | Speed (fps) | Speedup vs Uncached | Notes |
+|---------|-------------|---------------------|-------|
+| **Graph-Reuse** | **154.2** | **2.4x** | Batched context + allocator reuse |
+| GPU-Optimized | 133.8 | 2.1x | GPU-resident KV cache |
+| Uncached | 64.0 | 1.0x | Full decoder each step |
+
+Key optimizations in graph-reuse version:
+- **Batched context processing**: All 110 context frames in ONE graph (7.4ms total)
+- **Persistent allocator**: Reserve once for max graph size, reuse across all steps
+- **26% faster than GPU-Optimized**, builds on all previous optimizations
 
 Key optimizations in GPU-optimized version:
 - Pre-allocate KV cache as flat tensors on GPU: `ggml_backend_alloc_ctx_tensors()`
@@ -239,6 +244,33 @@ Key optimizations in GPU-optimized version:
 This is likely due to differences in how context frames are processed. The uncached version
 processes the full sequence at once, while cached versions process frame-by-frame. Both produce
 valid speech, but the specific codes diverge due to numerical differences in order of operations.
+
+### Completed Implementation Steps (Graph Reuse Optimization)
+29. ✅ **Graph-Reuse Optimization** - `magpie_synthesize_codes_graph_reuse()` implemented
+    - **Batched context processing**: All 110 context frames in ONE graph pass
+      - Uses `ggml_get_rows` for dynamic position embedding lookup
+      - Batched causal self-attention with `ggml_diag_mask_inf`
+      - 110 frames processed in ~7ms vs ~110ms before (15x faster for context)
+    - **Persistent allocator reuse**: Reserve once, reuse across all autoregressive steps
+      - Avoids allocator recreation overhead each step
+    - **Performance: 154 fps on RTX 4080** (26% faster than GPU-Optimized)
+    - Test: `./test_graph_reuse --text "Hello world" --compare`
+
+### Completed Implementation Steps (Streaming API)
+30. ✅ **Streaming TTS API** - `magpie_synthesize_streaming()` implemented
+    - **Callback-based audio delivery**: Audio chunks delivered as they're generated
+    - **Sentence chunking**: Splits text at sentence boundaries for lower latency
+    - **Configurable chunk size**: Trade latency vs throughput (4 frames = 186ms default)
+    - **Performance metrics**:
+      - Time to first audio: ~165-193 ms (depending on chunk size)
+      - Real-time factor: 1.4-3.3x (depending on chunk size)
+    - Test: `./test_streaming --text "Hello! World." --chunk-size 4`
+
+### Completed Implementation Steps (Quantization Fix)
+31. ✅ **Q8 Quantization Fix** - Fixed block-size validation
+    - Small tensors (inner dim < 32) now kept as F32
+    - Q8 model: 679 MB (vs 858 MB F32) - 21% smaller
+    - Reconvert with: `uv run scripts/convert_magpie_to_gguf.py ... -q q8`
 
 ### Completed Implementation Steps (EOS Detection & Tokenizer)
 27. ✅ **Improved EOS Detection** - Full NeMo-compatible EOS handling
@@ -257,10 +289,13 @@ valid speech, but the specific codes diverge due to numerical differences in ord
 ### TOKENIZER COMPLETE ✅
 
 The model now accepts raw text input without requiring external tokenization:
-- **Usage**: All test binaries accept `--text "Your text here"`
-  - `./test_e2e_inference --text "Hello world"` (standard)
-  - `./test_e2e_optimized --text "Hello world"` (GPU-optimized, 100+ fps)
-  - `./test_e2e_cached --text "Hello world"` (KV-cached)
+- **Main Binary**: `./magpie-tts -t "Your text here" -o output.wav`
+  - Uses graph-reuse (fastest, 154+ fps)
+  - Run `./magpie-tts --help` for all options
+- **Test binaries** also accept `--text`:
+  - `./test_graph_reuse --text "Hello world"` (fastest, 154 fps)
+  - `./test_e2e_optimized --text "Hello world"` (GPU-optimized, 134 fps)
+  - `./test_e2e_inference --text "Hello world"` (standard, 64 fps)
 - **Dictionary**: 125,854 English word pronunciations (IPA)
 - **Vocabulary**: 96 phoneme tokens + punctuation + special tokens
 - **Text Normalization** (matches NeMo behavior):
@@ -491,10 +526,11 @@ USAGE:
   # Generates output.wav from text input (uses built-in tokenizer)
 
 REMAINING OPTIMIZATION:
-1. KV cache for decoder (currently O(n²) per step)
+1. ~~KV cache for decoder~~ ✅ DONE (GPU-resident cache)
 2. ~~EOS detection tuning~~ ✅ DONE
 3. ~~Temperature/top-k sampling~~ ✅ DONE
-4. Streaming/real-time support
+4. ~~Graph reuse~~ ✅ DONE (batched context + allocator reuse, 154 fps)
+5. Streaming/real-time support
 
 KEY FILES:
 - src/magpie.cpp, src/magpie.h - main TTS model implementation
@@ -505,14 +541,15 @@ KEY FILES:
 
 ## Quick Test Commands
 ```bash
-# End-to-end TTS (text → audio WAV file)
-./test_e2e_inference --text "Hello, how are you?"      # Standard (uncached)
-./test_e2e_optimized --text "Hello, how are you?"      # GPU-optimized (76+ fps)
-./test_e2e_cached --text "Hello, how are you?"         # KV-cached
+# Main binary (recommended)
+./magpie-tts -t "Hello, how are you?" -o output.wav   # Graph-reuse (154 fps, FASTEST)
+./magpie-tts -t "Hello" -o hello.wav --temp 0.5       # Custom temperature
+./magpie-tts --help                                   # Show all options
 
-# Run with default text (no args needed)
-./test_e2e_inference                                   # Uses built-in test text
-./test_e2e_optimized                                   # Uses built-in test text
+# Test binaries
+./test_graph_reuse --text "Hello, how are you?"        # Graph-reuse (154 fps)
+./test_e2e_optimized --text "Hello, how are you?"      # GPU-optimized (134 fps)
+./test_e2e_inference --text "Hello, how are you?"      # Standard (64 fps)
 
 # Component tests
 ./test_full_encoder_v2   # Encoder: 6 layers, max diff 0.008
@@ -523,8 +560,8 @@ KEY FILES:
 ./test_codec_decode      # Full codec decoder: max diff 0.004
 
 # Performance comparison
-./test_e2e_cached --compare     # Compare cached vs uncached
-./test_e2e_optimized --compare-all  # Compare all three versions
+./test_graph_reuse --compare    # Compare all versions (recommended)
+./test_e2e_optimized --compare-all  # Compare GPU-optimized versions
 
 # Generate reference data (if needed)
 uv run scripts/dump_reference.py --text "Hello world" --output-dir test_data/reference

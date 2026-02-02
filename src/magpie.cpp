@@ -5,6 +5,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <chrono>
 
 //
 // Backend initialization helpers
@@ -3906,4 +3907,963 @@ std::vector<int32_t> magpie_synthesize_codes_optimized(
             (int)(result.size() / 8));
 
     return result;
+}
+
+// Build batched self-attention for context frames with causal masking
+// Processes multiple frames in parallel, writing all K/V to cache
+static ggml_tensor * magpie_build_batched_self_attention_gpu(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    ggml_tensor * input,           // [d_model, batch_size]
+    ggml_tensor * qkv_weight,      // [3*d_model, d_model]
+    ggml_tensor * out_weight,      // [d_model, d_model]
+    ggml_tensor * kv_cache_k,      // flat cache
+    ggml_tensor * kv_cache_v,      // flat cache
+    int layer_idx,
+    int start_pos,                 // starting cache position
+    int max_seq,
+    int n_heads) {
+
+    if (!input || !qkv_weight || !out_weight) return nullptr;
+
+    const int64_t d_model = input->ne[0];
+    const int64_t batch_size = input->ne[1];
+    const int64_t d_head = d_model / n_heads;
+
+    // Compute QKV for all tokens: [3*d_model, batch_size]
+    struct ggml_tensor * qkv = ggml_mul_mat(ctx, qkv_weight, input);
+
+    // Split into Q, K, V each [d_model, batch_size]
+    struct ggml_tensor * q = ggml_view_2d(ctx, qkv, d_model, batch_size, qkv->nb[1], 0);
+    struct ggml_tensor * k = ggml_view_2d(ctx, qkv, d_model, batch_size, qkv->nb[1], d_model * sizeof(float));
+    struct ggml_tensor * v = ggml_view_2d(ctx, qkv, d_model, batch_size, qkv->nb[1], 2 * d_model * sizeof(float));
+
+    q = ggml_cont(ctx, q);
+    k = ggml_cont(ctx, k);
+    v = ggml_cont(ctx, v);
+
+    // Write K/V to cache starting at start_pos
+    size_t layer_offset = (size_t)layer_idx * max_seq * d_model * sizeof(float);
+    size_t pos_offset = (size_t)start_pos * d_model * sizeof(float);
+    size_t total_offset = layer_offset + pos_offset;
+
+    struct ggml_tensor * k_cache_slot = ggml_view_2d(ctx, kv_cache_k, d_model, batch_size,
+                                                      d_model * sizeof(float), total_offset);
+    struct ggml_tensor * v_cache_slot = ggml_view_2d(ctx, kv_cache_v, d_model, batch_size,
+                                                      d_model * sizeof(float), total_offset);
+
+    struct ggml_tensor * k_cpy = ggml_cpy(ctx, k, k_cache_slot);
+    struct ggml_tensor * v_cpy = ggml_cpy(ctx, v, v_cache_slot);
+    ggml_build_forward_expand(gf, k_cpy);
+    ggml_build_forward_expand(gf, v_cpy);
+
+    // Reshape for multi-head attention
+    // Q, K, V: [d_head, n_heads, batch_size]
+    q = ggml_reshape_3d(ctx, q, d_head, n_heads, batch_size);
+    k = ggml_reshape_3d(ctx, k, d_head, n_heads, batch_size);
+    v = ggml_reshape_3d(ctx, v, d_head, n_heads, batch_size);
+
+    // Permute to [d_head, batch, n_heads]
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+
+    float scale = 1.0f / sqrtf((float)d_head);
+
+    // Attention scores: [batch_size, batch_size, n_heads]
+    struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    scores = ggml_scale(ctx, scores, scale);
+
+    // Apply causal mask
+    scores = ggml_diag_mask_inf(ctx, scores, 0);
+    scores = ggml_soft_max(ctx, scores);
+
+    // Apply to values
+    struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
+    struct ggml_tensor * attn_out = ggml_mul_mat(ctx, v_perm, scores);
+
+    // Reshape back to [d_model, batch_size]
+    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+    attn_out = ggml_reshape_2d(ctx, attn_out, d_model, batch_size);
+
+    // Output projection
+    return ggml_mul_mat(ctx, out_weight, attn_out);
+}
+
+// Build batched decoder layer for context processing
+static ggml_tensor * magpie_build_batched_decoder_layer_gpu(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    ggml_tensor * input,           // [d_model, batch_size]
+    ggml_tensor * xa_k_cached,     // [d_xa, enc_seq]
+    ggml_tensor * xa_v_cached,     // [d_xa, enc_seq]
+    ggml_tensor * kv_cache_k,
+    ggml_tensor * kv_cache_v,
+    int layer_idx,
+    int start_pos,
+    int max_seq,
+    magpie_decoder_layer * layer,
+    const magpie_hparams * hp) {
+
+    struct ggml_tensor * x = input;
+    const int64_t batch_size = input->ne[1];
+
+    // Self-attention with batched causal attention
+    struct ggml_tensor * residual = x;
+    x = magpie_build_layer_norm(ctx, x, layer->norm_self_w, hp->eps);
+    x = magpie_build_batched_self_attention_gpu(ctx, gf, x,
+        layer->sa_qkv_w, layer->sa_out_w,
+        kv_cache_k, kv_cache_v,
+        layer_idx, start_pos, max_seq,
+        hp->dec_sa_heads);
+    if (!x) return nullptr;
+    x = ggml_add(ctx, x, residual);
+
+    // Cross-attention (same for all frames in batch - they all attend to same encoder output)
+    residual = x;
+    struct ggml_tensor * norm_q = magpie_build_layer_norm(ctx, x, layer->norm_xa_q_w, hp->eps);
+
+    // Cross-attention for batched queries
+    // norm_q: [d_model, batch_size], xa_k/v: [d_xa, enc_seq]
+    const int64_t d_model = norm_q->ne[0];
+    const int n_heads = hp->dec_xa_heads;
+    const int d_head = hp->dec_xa_d_head;
+    const int64_t enc_seq = xa_k_cached->ne[1];
+
+    // Query projection for all frames: [d_xa, batch_size]
+    struct ggml_tensor * q = ggml_mul_mat(ctx, layer->xa_q_w, norm_q);
+    q = ggml_reshape_3d(ctx, q, d_head, n_heads, batch_size);
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+
+    // K/V already computed and cached
+    struct ggml_tensor * k = ggml_reshape_3d(ctx, xa_k_cached, d_head, n_heads, enc_seq);
+    struct ggml_tensor * v = ggml_reshape_3d(ctx, xa_v_cached, d_head, n_heads, enc_seq);
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+
+    float scale = 1.0f / sqrtf((float)d_head);
+    struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    scores = ggml_scale(ctx, scores, scale);
+    scores = ggml_soft_max(ctx, scores);
+
+    struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
+    struct ggml_tensor * xa_out = ggml_mul_mat(ctx, v_perm, scores);
+    xa_out = ggml_cont(ctx, ggml_permute(ctx, xa_out, 0, 2, 1, 3));
+    xa_out = ggml_reshape_2d(ctx, xa_out, n_heads * d_head, batch_size);
+    xa_out = ggml_mul_mat(ctx, layer->xa_out_w, xa_out);
+
+    x = ggml_add(ctx, x, xa_out);
+
+    // FFN (kernel=1 for decoder, so just pointwise)
+    residual = x;
+    x = magpie_build_layer_norm(ctx, x, layer->norm_ff_w, hp->eps);
+    x = magpie_build_conv_ffn(ctx, x, layer->ff_proj_w, layer->ff_out_w, hp->dec_kernel);
+    x = ggml_add(ctx, x, residual);
+
+    return x;
+}
+
+// Graph-reuse optimized synthesis
+std::vector<int32_t> magpie_synthesize_codes_graph_reuse(
+    magpie_context * mctx,
+    const int32_t * tokens,
+    int n_tokens) {
+
+    if (!mctx || !tokens || n_tokens <= 0) {
+        fprintf(stderr, "magpie_synthesize_codes_graph_reuse: invalid args\n");
+        return {};
+    }
+
+    const auto & hp = mctx->model.hparams;
+    const int d_model = hp.d_model;
+    const int n_dec_layers = hp.dec_layers;
+    const int d_xa = hp.dec_xa_heads * hp.dec_xa_d_head;
+    const int max_seq = hp.context_frames + hp.max_dec_steps + 16;
+
+    auto time_start = std::chrono::high_resolution_clock::now();
+
+    // Step 1: Encode text
+    fprintf(stderr, "magpie: [graph-reuse] encoding text (%d tokens)...\n", n_tokens);
+    if (!magpie_encode_text(mctx, tokens, n_tokens)) {
+        fprintf(stderr, "magpie_synthesize_codes_graph_reuse: text encoding failed\n");
+        return {};
+    }
+    const int enc_seq = mctx->state.enc_seq_len;
+
+    // Step 2: Initialize GPU-resident KV cache
+    magpie_kv_cache cache;
+    if (!magpie_kv_cache_init_gpu(cache, mctx->model.backend,
+                                   n_dec_layers, d_model, max_seq,
+                                   hp.dec_xa_heads, hp.dec_xa_d_head, enc_seq)) {
+        fprintf(stderr, "magpie: failed to init GPU KV cache\n");
+        return {};
+    }
+
+    // Step 3: Pre-compute cross-attention K/V (same as before)
+    fprintf(stderr, "magpie: pre-computing cross-attention K/V...\n");
+    for (int l = 0; l < n_dec_layers; l++) {
+        size_t ctx_size = ggml_tensor_overhead() * 32 + 256 * 1024 * 1024;
+        struct ggml_init_params params = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        struct ggml_tensor * enc_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, enc_seq);
+        ggml_set_input(enc_out);
+
+        struct ggml_tensor * k_out = nullptr;
+        struct ggml_tensor * v_out = nullptr;
+        magpie_precompute_cross_attention_kv(ctx0, enc_out,
+            mctx->model.decoder.layers[l].xa_kv_w,
+            mctx->model.decoder.layers[l].norm_xa_mem_w,
+            hp.eps, &k_out, &v_out);
+
+        size_t layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+        struct ggml_tensor * xa_k_slot = ggml_view_1d(ctx0, cache.xa_k_cache[0], enc_seq * d_xa, layer_offset);
+        struct ggml_tensor * xa_v_slot = ggml_view_1d(ctx0, cache.xa_v_cache[0], enc_seq * d_xa, layer_offset);
+
+        struct ggml_tensor * k_cpy = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, k_out, enc_seq * d_xa), xa_k_slot);
+        struct ggml_tensor * v_cpy = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, v_out, enc_seq * d_xa), xa_v_slot);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, k_cpy);
+        ggml_build_forward_expand(gf, v_cpy);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        ggml_backend_tensor_set(enc_out, mctx->state.encoder_output.data(), 0,
+                                mctx->state.encoder_output.size() * sizeof(float));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    // Step 4: Extract baked context
+    std::vector<float> context_data(hp.context_frames * d_model);
+    {
+        size_t ctx_size = ggml_tensor_overhead() * 16 + 1024 * 1024;
+        struct ggml_init_params params = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        struct ggml_tensor * speaker_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(speaker_idx);
+
+        struct ggml_tensor * flat = ggml_get_rows(ctx0, mctx->model.embeddings.baked_context_w, speaker_idx);
+        ggml_set_output(flat);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, flat);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        int32_t sid = mctx->speaker_id;
+        ggml_backend_tensor_set(speaker_idx, &sid, 0, sizeof(int32_t));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_backend_tensor_get(flat, context_data.data(), 0, context_data.size() * sizeof(float));
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    // Step 5: BATCHED context processing - all 110 frames in ONE graph!
+    fprintf(stderr, "magpie: [graph-reuse] processing %d context frames in ONE batched pass...\n", hp.context_frames);
+    auto ctx_start = std::chrono::high_resolution_clock::now();
+    {
+        size_t ctx_size = ggml_tensor_overhead() * 8192 + 1024 * 1024 * 1024;
+        struct ggml_init_params params = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        const int batch_size = hp.context_frames;
+
+        // Input: all context embeddings [d_model, batch_size]
+        struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, batch_size);
+        ggml_set_input(input);
+
+        // Position indices for embedding lookup [batch_size]
+        struct ggml_tensor * pos_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+        ggml_set_input(pos_indices);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 65536, false);
+
+        // Position embeddings via get_rows: [d_model, batch_size]
+        struct ggml_tensor * pos_emb = ggml_get_rows(ctx0, mctx->model.decoder.pos_emb_w, pos_indices);
+        struct ggml_tensor * x = ggml_add(ctx0, input, pos_emb);
+
+        // Run all decoder layers with batched attention
+        for (int l = 0; l < n_dec_layers; l++) {
+            size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+            struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+
+            x = magpie_build_batched_decoder_layer_gpu(ctx0, gf, x,
+                xa_k, xa_v,
+                cache.k_cache[0], cache.v_cache[0],
+                l, 0, max_seq,  // start_pos = 0 for context
+                &mctx->model.decoder.layers[l], &hp);
+            if (!x) {
+                fprintf(stderr, "magpie: batched decoder layer %d failed\n", l);
+                ggml_free(ctx0);
+                magpie_kv_cache_free_gpu(cache);
+                return {};
+            }
+        }
+
+        // Final norm
+        x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        // Allocate and run
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        if (!ggml_gallocr_reserve(allocr, gf) || !ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "magpie: batched context alloc failed\n");
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+            magpie_kv_cache_free_gpu(cache);
+            return {};
+        }
+
+        // Set inputs
+        ggml_backend_tensor_set(input, context_data.data(), 0, context_data.size() * sizeof(float));
+
+        std::vector<int32_t> pos_data(batch_size);
+        for (int i = 0; i < batch_size; i++) pos_data[i] = i;
+        ggml_backend_tensor_set(pos_indices, pos_data.data(), 0, batch_size * sizeof(int32_t));
+
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+    auto ctx_end = std::chrono::high_resolution_clock::now();
+    double ctx_time = std::chrono::duration<double, std::milli>(ctx_end - ctx_start).count();
+    fprintf(stderr, "magpie: context processing done in %.1f ms\n", ctx_time);
+
+    int cache_pos = hp.context_frames;
+
+    // Step 6: Initialize audio sequence with BOS and process
+    std::vector<int32_t> audio_codes;
+    for (int cb = 0; cb < 8; cb++) {
+        audio_codes.push_back(hp.audio_bos_id);
+    }
+
+    // Create persistent allocator for autoregressive steps
+    // Reserve for maximum possible graph size
+    ggml_gallocr_t persistent_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+
+    // Pre-compute XA cache views (constant across all steps)
+    struct xa_views {
+        std::vector<std::pair<size_t, size_t>> offsets;  // layer -> (k_offset, v_offset) - same for our flat cache
+    };
+
+    // Process BOS frame and start autoregressive loop
+    std::vector<float> decoder_hidden(d_model);
+    bool allocr_reserved = false;
+
+    // Step 7: Autoregressive generation with allocator reuse
+    fprintf(stderr, "magpie: [graph-reuse] starting autoregressive decoding...\n");
+    auto gen_start = std::chrono::high_resolution_clock::now();
+
+    const int min_generated_frames = 4;
+    int total_steps = 0;
+
+    // First pass: BOS frame + first sample
+    {
+        std::vector<float> bos_emb(d_model);
+        int32_t bos_codes[8];
+        for (int cb = 0; cb < 8; cb++) bos_codes[cb] = hp.audio_bos_id;
+        compute_single_frame_audio_embedding(mctx, bos_codes, bos_emb);
+
+        size_t ctx_size = ggml_tensor_overhead() * 4096 + 512 * 1024 * 1024;
+        struct ggml_init_params params = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(params);
+
+        struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, 1);
+        ggml_set_input(input);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+        struct ggml_tensor * pos_slice = ggml_view_2d(ctx0, mctx->model.decoder.pos_emb_w,
+            d_model, 1, mctx->model.decoder.pos_emb_w->nb[1],
+            cache_pos * mctx->model.decoder.pos_emb_w->nb[1]);
+        struct ggml_tensor * x = ggml_add(ctx0, input, pos_slice);
+
+        for (int l = 0; l < n_dec_layers; l++) {
+            size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+            struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+
+            x = magpie_build_decoder_layer_gpu_cached(ctx0, gf, x,
+                xa_k, xa_v,
+                cache.k_cache[0], cache.v_cache[0],
+                l, cache_pos, max_seq,
+                &mctx->model.decoder.layers[l], &hp);
+        }
+        x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        // Reserve allocator for this graph size (will be reused)
+        ggml_gallocr_reserve(persistent_allocr, gf);
+        allocr_reserved = true;
+
+        ggml_gallocr_alloc_graph(persistent_allocr, gf);
+        ggml_backend_tensor_set(input, bos_emb.data(), 0, d_model * sizeof(float));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_backend_tensor_get(x, decoder_hidden.data(), 0, d_model * sizeof(float));
+
+        ggml_free(ctx0);
+        cache_pos++;
+    }
+
+    // Main autoregressive loop with allocator reuse
+    for (int step = 0; step < hp.max_dec_steps; step++) {
+        total_steps++;
+
+        // Sample codes
+        bool forbid_eos = (step < min_generated_frames);
+        magpie_sample_result sample_result = magpie_local_transformer_sample_all(
+            mctx, decoder_hidden.data(), mctx->temperature, mctx->top_k, forbid_eos);
+
+        if (sample_result.sampled_codes.size() != 8) {
+            fprintf(stderr, "magpie: local transformer failed at step %d\n", step);
+            break;
+        }
+
+        if (step < 3 || (step % 50) == 0) {
+            fprintf(stderr, "magpie: step %d codes:", step);
+            for (int cb = 0; cb < 8; cb++) fprintf(stderr, " %d", sample_result.sampled_codes[cb]);
+            fprintf(stderr, "\n");
+        }
+
+        // Check EOS
+        bool has_eos = false;
+        for (int cb = 0; cb < 8; cb++) {
+            if (sample_result.sampled_codes[cb] == hp.audio_eos_id ||
+                sample_result.argmax_codes[cb] == hp.audio_eos_id) {
+                has_eos = true;
+                break;
+            }
+        }
+        if (has_eos) {
+            fprintf(stderr, "magpie: EOS detected at step %d\n", step);
+            break;
+        }
+
+        for (int cb = 0; cb < 8; cb++) {
+            audio_codes.push_back(sample_result.sampled_codes[cb]);
+        }
+
+        if (step + 1 >= hp.max_dec_steps) break;
+
+        // Compute next hidden state
+        std::vector<float> prev_emb(d_model);
+        int frame_idx = (int)(audio_codes.size() / 8) - 1;
+        compute_single_frame_audio_embedding(mctx, &audio_codes[frame_idx * 8], prev_emb);
+
+        // Build graph for this step (reuses allocator reservation)
+        {
+            size_t ctx_size = ggml_tensor_overhead() * 4096 + 512 * 1024 * 1024;
+            struct ggml_init_params params = { ctx_size, nullptr, true };
+            struct ggml_context * ctx0 = ggml_init(params);
+
+            struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, 1);
+            ggml_set_input(input);
+
+            struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+            struct ggml_tensor * pos_slice = ggml_view_2d(ctx0, mctx->model.decoder.pos_emb_w,
+                d_model, 1, mctx->model.decoder.pos_emb_w->nb[1],
+                cache_pos * mctx->model.decoder.pos_emb_w->nb[1]);
+            struct ggml_tensor * x = ggml_add(ctx0, input, pos_slice);
+
+            for (int l = 0; l < n_dec_layers; l++) {
+                size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+                struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                         d_xa * sizeof(float), xa_layer_offset);
+                struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                         d_xa * sizeof(float), xa_layer_offset);
+
+                x = magpie_build_decoder_layer_gpu_cached(ctx0, gf, x,
+                    xa_k, xa_v,
+                    cache.k_cache[0], cache.v_cache[0],
+                    l, cache_pos, max_seq,
+                    &mctx->model.decoder.layers[l], &hp);
+            }
+            x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+            ggml_set_output(x);
+            ggml_build_forward_expand(gf, x);
+
+            // Allocator already reserved - just alloc and compute
+            ggml_gallocr_alloc_graph(persistent_allocr, gf);
+            ggml_backend_tensor_set(input, prev_emb.data(), 0, d_model * sizeof(float));
+            ggml_backend_graph_compute(mctx->model.backend, gf);
+            ggml_backend_tensor_get(x, decoder_hidden.data(), 0, d_model * sizeof(float));
+
+            ggml_free(ctx0);
+            cache_pos++;
+        }
+    }
+
+    auto gen_end = std::chrono::high_resolution_clock::now();
+    double gen_time = std::chrono::duration<double>(gen_end - gen_start).count();
+
+    // Cleanup
+    ggml_gallocr_free(persistent_allocr);
+    magpie_kv_cache_free_gpu(cache);
+
+    // Return generated codes (excluding BOS frame)
+    std::vector<int32_t> result;
+    for (size_t i = 8; i < audio_codes.size(); i++) {
+        result.push_back(audio_codes[i]);
+    }
+
+    auto time_end = std::chrono::high_resolution_clock::now();
+    double total_time = std::chrono::duration<double>(time_end - time_start).count();
+    int n_frames = result.size() / 8;
+
+    fprintf(stderr, "magpie: [graph-reuse] synthesis complete:\n");
+    fprintf(stderr, "  - %d audio frames in %.2f seconds (%.1f fps)\n", n_frames, gen_time, n_frames / gen_time);
+    fprintf(stderr, "  - Total time: %.2f seconds\n", total_time);
+    fprintf(stderr, "  - Context batching: %.1f ms for %d frames\n", ctx_time, hp.context_frames);
+
+    return result;
+}
+
+//
+// Streaming TTS Implementation
+//
+
+// Split text into sentences at sentence boundaries
+std::vector<std::string> magpie_split_sentences(const char * text) {
+    std::vector<std::string> sentences;
+    if (!text || !*text) return sentences;
+
+    std::string current;
+    const char * p = text;
+
+    while (*p) {
+        current += *p;
+
+        // Check for sentence boundary
+        bool is_boundary = false;
+        if (*p == '.' || *p == '!' || *p == '?') {
+            char next = *(p + 1);
+            if (next == '\0' || next == ' ' || next == '\n' || next == '\t') {
+                is_boundary = true;
+            }
+        }
+
+        if (is_boundary) {
+            // Trim leading whitespace
+            size_t start = current.find_first_not_of(" \t\n\r");
+            if (start != std::string::npos) {
+                sentences.push_back(current.substr(start));
+            }
+            current.clear();
+        }
+
+        p++;
+    }
+
+    // Don't forget remaining text
+    if (!current.empty()) {
+        size_t start = current.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            sentences.push_back(current.substr(start));
+        }
+    }
+
+    return sentences;
+}
+
+// Helper to decode a batch of frames to audio
+static std::vector<float> decode_frames_to_audio(
+    magpie_codec * codec,
+    const std::vector<int32_t> & codes,
+    int n_frames) {
+
+    if (n_frames <= 0 || codes.size() < (size_t)(n_frames * 8)) {
+        return {};
+    }
+
+    // Reorder from [frames, 8] to [8, frames] for codec
+    std::vector<int32_t> reordered(n_frames * 8);
+    for (int t = 0; t < n_frames; t++) {
+        for (int cb = 0; cb < 8; cb++) {
+            reordered[cb * n_frames + t] = codes[t * 8 + cb];
+        }
+    }
+
+    return magpie_codec_decode(codec, reordered.data(), n_frames);
+}
+
+// Streaming synthesis for a single sentence
+int magpie_synthesize_sentence_streaming(
+    magpie_context * mctx,
+    magpie_codec * codec,
+    const int32_t * tokens,
+    int n_tokens,
+    const magpie_stream_params & params) {
+
+    if (!mctx || !codec || !tokens || n_tokens <= 0) {
+        return -1;
+    }
+
+    const auto & hp = mctx->model.hparams;
+    const int d_model = hp.d_model;
+    const int n_dec_layers = hp.dec_layers;
+    const int d_xa = hp.dec_xa_heads * hp.dec_xa_d_head;
+    const int max_seq = hp.context_frames + hp.max_dec_steps + 16;
+
+    mctx->temperature = params.temperature;
+    mctx->top_k = params.top_k;
+    mctx->speaker_id = params.speaker_id;
+
+    // Encode text
+    if (!magpie_encode_text(mctx, tokens, n_tokens)) {
+        return -1;
+    }
+    const int enc_seq = mctx->state.enc_seq_len;
+
+    // Initialize KV cache
+    magpie_kv_cache cache;
+    if (!magpie_kv_cache_init_gpu(cache, mctx->model.backend,
+                                   n_dec_layers, d_model, max_seq,
+                                   hp.dec_xa_heads, hp.dec_xa_d_head, enc_seq)) {
+        return -1;
+    }
+
+    // Pre-compute cross-attention K/V
+    for (int l = 0; l < n_dec_layers; l++) {
+        size_t ctx_size = ggml_tensor_overhead() * 32 + 256 * 1024 * 1024;
+        struct ggml_init_params gparams = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(gparams);
+
+        struct ggml_tensor * enc_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, enc_seq);
+        ggml_set_input(enc_out);
+
+        struct ggml_tensor * k_out = nullptr;
+        struct ggml_tensor * v_out = nullptr;
+        magpie_precompute_cross_attention_kv(ctx0, enc_out,
+            mctx->model.decoder.layers[l].xa_kv_w,
+            mctx->model.decoder.layers[l].norm_xa_mem_w,
+            hp.eps, &k_out, &v_out);
+
+        size_t layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+        struct ggml_tensor * xa_k_slot = ggml_view_1d(ctx0, cache.xa_k_cache[0], enc_seq * d_xa, layer_offset);
+        struct ggml_tensor * xa_v_slot = ggml_view_1d(ctx0, cache.xa_v_cache[0], enc_seq * d_xa, layer_offset);
+
+        struct ggml_tensor * k_cpy = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, k_out, enc_seq * d_xa), xa_k_slot);
+        struct ggml_tensor * v_cpy = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, v_out, enc_seq * d_xa), xa_v_slot);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, k_cpy);
+        ggml_build_forward_expand(gf, v_cpy);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+        ggml_backend_tensor_set(enc_out, mctx->state.encoder_output.data(), 0,
+                                mctx->state.encoder_output.size() * sizeof(float));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    // Extract baked context
+    std::vector<float> context_data(hp.context_frames * d_model);
+    {
+        size_t ctx_size = ggml_tensor_overhead() * 16 + 1024 * 1024;
+        struct ggml_init_params gparams = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(gparams);
+
+        struct ggml_tensor * speaker_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(speaker_idx);
+        struct ggml_tensor * flat = ggml_get_rows(ctx0, mctx->model.embeddings.baked_context_w, speaker_idx);
+        ggml_set_output(flat);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, flat);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        int32_t sid = params.speaker_id;
+        ggml_backend_tensor_set(speaker_idx, &sid, 0, sizeof(int32_t));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_backend_tensor_get(flat, context_data.data(), 0, context_data.size() * sizeof(float));
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    // Batched context processing
+    {
+        size_t ctx_size = ggml_tensor_overhead() * 8192 + 1024 * 1024 * 1024;
+        struct ggml_init_params gparams = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(gparams);
+
+        const int batch_size = hp.context_frames;
+        struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, batch_size);
+        ggml_set_input(input);
+        struct ggml_tensor * pos_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+        ggml_set_input(pos_indices);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 65536, false);
+
+        struct ggml_tensor * pos_emb = ggml_get_rows(ctx0, mctx->model.decoder.pos_emb_w, pos_indices);
+        struct ggml_tensor * x = ggml_add(ctx0, input, pos_emb);
+
+        for (int l = 0; l < n_dec_layers; l++) {
+            size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+            struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            x = magpie_build_batched_decoder_layer_gpu(ctx0, gf, x, xa_k, xa_v,
+                cache.k_cache[0], cache.v_cache[0], l, 0, max_seq,
+                &mctx->model.decoder.layers[l], &hp);
+            if (!x) {
+                ggml_free(ctx0);
+                magpie_kv_cache_free_gpu(cache);
+                return -1;
+            }
+        }
+
+        x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+        if (!ggml_gallocr_reserve(allocr, gf) || !ggml_gallocr_alloc_graph(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+            magpie_kv_cache_free_gpu(cache);
+            return -1;
+        }
+
+        ggml_backend_tensor_set(input, context_data.data(), 0, context_data.size() * sizeof(float));
+        std::vector<int32_t> pos_data(batch_size);
+        for (int i = 0; i < batch_size; i++) pos_data[i] = i;
+        ggml_backend_tensor_set(pos_indices, pos_data.data(), 0, batch_size * sizeof(int32_t));
+
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    int cache_pos = hp.context_frames;
+
+    // BOS frame processing
+    std::vector<int32_t> audio_codes;
+    for (int cb = 0; cb < 8; cb++) audio_codes.push_back(hp.audio_bos_id);
+
+    std::vector<float> decoder_hidden(d_model);
+    ggml_gallocr_t persistent_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(mctx->model.backend));
+
+    {
+        std::vector<float> bos_emb(d_model);
+        int32_t bos_codes[8];
+        for (int cb = 0; cb < 8; cb++) bos_codes[cb] = hp.audio_bos_id;
+        compute_single_frame_audio_embedding(mctx, bos_codes, bos_emb);
+
+        size_t ctx_size = ggml_tensor_overhead() * 4096 + 512 * 1024 * 1024;
+        struct ggml_init_params gparams = { ctx_size, nullptr, true };
+        struct ggml_context * ctx0 = ggml_init(gparams);
+
+        struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, 1);
+        ggml_set_input(input);
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+        struct ggml_tensor * pos_slice = ggml_view_2d(ctx0, mctx->model.decoder.pos_emb_w,
+            d_model, 1, mctx->model.decoder.pos_emb_w->nb[1],
+            cache_pos * mctx->model.decoder.pos_emb_w->nb[1]);
+        struct ggml_tensor * x = ggml_add(ctx0, input, pos_slice);
+
+        for (int l = 0; l < n_dec_layers; l++) {
+            size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+            struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                     d_xa * sizeof(float), xa_layer_offset);
+            x = magpie_build_decoder_layer_gpu_cached(ctx0, gf, x, xa_k, xa_v,
+                cache.k_cache[0], cache.v_cache[0], l, cache_pos, max_seq,
+                &mctx->model.decoder.layers[l], &hp);
+        }
+        x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        ggml_gallocr_reserve(persistent_allocr, gf);
+        ggml_gallocr_alloc_graph(persistent_allocr, gf);
+        ggml_backend_tensor_set(input, bos_emb.data(), 0, d_model * sizeof(float));
+        ggml_backend_graph_compute(mctx->model.backend, gf);
+        ggml_backend_tensor_get(x, decoder_hidden.data(), 0, d_model * sizeof(float));
+
+        ggml_free(ctx0);
+        cache_pos++;
+    }
+
+    // Autoregressive generation with streaming output
+    int total_samples = 0;
+    std::vector<int32_t> pending_codes;
+    const int frames_per_chunk = params.frames_per_chunk > 0 ? params.frames_per_chunk : 4;
+    const int min_generated_frames = 4;
+
+    for (int step = 0; step < hp.max_dec_steps; step++) {
+        bool forbid_eos = (step < min_generated_frames);
+        magpie_sample_result sample_result = magpie_local_transformer_sample_all(
+            mctx, decoder_hidden.data(), mctx->temperature, mctx->top_k, forbid_eos);
+
+        if (sample_result.sampled_codes.size() != 8) break;
+
+        // Check EOS
+        bool has_eos = false;
+        for (int cb = 0; cb < 8; cb++) {
+            if (sample_result.sampled_codes[cb] == hp.audio_eos_id ||
+                sample_result.argmax_codes[cb] == hp.audio_eos_id) {
+                has_eos = true;
+                break;
+            }
+        }
+
+        // Add codes to pending buffer
+        for (int cb = 0; cb < 8; cb++) {
+            pending_codes.push_back(sample_result.sampled_codes[cb]);
+            audio_codes.push_back(sample_result.sampled_codes[cb]);
+        }
+
+        // Decode and stream when we have enough frames (or EOS)
+        int pending_frames = pending_codes.size() / 8;
+        if (pending_frames >= frames_per_chunk || has_eos) {
+            std::vector<float> audio = decode_frames_to_audio(codec, pending_codes, pending_frames);
+            if (!audio.empty() && params.on_audio) {
+                bool continue_gen = params.on_audio(audio.data(), audio.size(), params.user_data);
+                if (!continue_gen) {
+                    has_eos = true;
+                }
+            }
+            total_samples += audio.size();
+            pending_codes.clear();
+
+            if (params.on_progress) {
+                params.on_progress((audio_codes.size() / 8) - 1, 0, 1, params.user_data);
+            }
+        }
+
+        if (has_eos) break;
+        if (step + 1 >= hp.max_dec_steps) break;
+
+        // Compute next hidden state
+        std::vector<float> prev_emb(d_model);
+        int frame_idx = (int)(audio_codes.size() / 8) - 1;
+        compute_single_frame_audio_embedding(mctx, &audio_codes[frame_idx * 8], prev_emb);
+
+        {
+            size_t ctx_size = ggml_tensor_overhead() * 4096 + 512 * 1024 * 1024;
+            struct ggml_init_params gparams = { ctx_size, nullptr, true };
+            struct ggml_context * ctx0 = ggml_init(gparams);
+
+            struct ggml_tensor * input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, 1);
+            ggml_set_input(input);
+            struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+            struct ggml_tensor * pos_slice = ggml_view_2d(ctx0, mctx->model.decoder.pos_emb_w,
+                d_model, 1, mctx->model.decoder.pos_emb_w->nb[1],
+                cache_pos * mctx->model.decoder.pos_emb_w->nb[1]);
+            struct ggml_tensor * x = ggml_add(ctx0, input, pos_slice);
+
+            for (int l = 0; l < n_dec_layers; l++) {
+                size_t xa_layer_offset = (size_t)l * enc_seq * d_xa * sizeof(float);
+                struct ggml_tensor * xa_k = ggml_view_2d(ctx0, cache.xa_k_cache[0], d_xa, enc_seq,
+                                                         d_xa * sizeof(float), xa_layer_offset);
+                struct ggml_tensor * xa_v = ggml_view_2d(ctx0, cache.xa_v_cache[0], d_xa, enc_seq,
+                                                         d_xa * sizeof(float), xa_layer_offset);
+                x = magpie_build_decoder_layer_gpu_cached(ctx0, gf, x, xa_k, xa_v,
+                    cache.k_cache[0], cache.v_cache[0], l, cache_pos, max_seq,
+                    &mctx->model.decoder.layers[l], &hp);
+            }
+            x = magpie_build_layer_norm(ctx0, x, mctx->model.decoder.norm_out_w, hp.eps);
+            ggml_set_output(x);
+            ggml_build_forward_expand(gf, x);
+
+            ggml_gallocr_alloc_graph(persistent_allocr, gf);
+            ggml_backend_tensor_set(input, prev_emb.data(), 0, d_model * sizeof(float));
+            ggml_backend_graph_compute(mctx->model.backend, gf);
+            ggml_backend_tensor_get(x, decoder_hidden.data(), 0, d_model * sizeof(float));
+
+            ggml_free(ctx0);
+            cache_pos++;
+        }
+    }
+
+    // Flush remaining pending codes
+    if (!pending_codes.empty()) {
+        int pending_frames = pending_codes.size() / 8;
+        std::vector<float> audio = decode_frames_to_audio(codec, pending_codes, pending_frames);
+        if (!audio.empty() && params.on_audio) {
+            params.on_audio(audio.data(), audio.size(), params.user_data);
+        }
+        total_samples += audio.size();
+    }
+
+    ggml_gallocr_free(persistent_allocr);
+    magpie_kv_cache_free_gpu(cache);
+
+    return total_samples;
+}
+
+// Full streaming synthesis with sentence chunking
+int magpie_synthesize_streaming(
+    magpie_context * mctx,
+    magpie_codec * codec,
+    const char * text,
+    const magpie_stream_params & params) {
+
+    if (!mctx || !codec || !text) {
+        return -1;
+    }
+
+    int total_samples = 0;
+
+    if (params.sentence_chunking) {
+        std::vector<std::string> sentences = magpie_split_sentences(text);
+        if (sentences.empty()) {
+            sentences.push_back(text);
+        }
+
+        for (size_t i = 0; i < sentences.size(); i++) {
+            const std::string & sentence = sentences[i];
+
+            fprintf(stderr, "magpie: [streaming] processing sentence %zu/%zu: \"%s\"\n",
+                    i + 1, sentences.size(), sentence.c_str());
+
+            std::vector<int32_t> tokens = magpie_tokenize(&mctx->model.tokenizer, sentence.c_str());
+            if (tokens.empty()) continue;
+
+            // Call progress with sentence info before processing
+            if (params.on_progress) {
+                params.on_progress(0, (int)i, (int)sentences.size(), params.user_data);
+            }
+
+            int samples = magpie_synthesize_sentence_streaming(mctx, codec, tokens.data(), tokens.size(), params);
+            if (samples < 0) return -1;
+            total_samples += samples;
+        }
+    } else {
+        std::vector<int32_t> tokens = magpie_tokenize(&mctx->model.tokenizer, text);
+        if (tokens.empty()) return -1;
+        total_samples = magpie_synthesize_sentence_streaming(mctx, codec, tokens.data(), tokens.size(), params);
+    }
+
+    return total_samples;
 }

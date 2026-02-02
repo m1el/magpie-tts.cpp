@@ -1,27 +1,82 @@
-// Streaming TTS test - generates and outputs audio incrementally
-// No hard limit on frames, relies on EOS detection
+// Streaming TTS test - demonstrates real-time audio output with callbacks
+// Audio is generated and delivered via callbacks as it becomes available
 
 #include "magpie.h"
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 #include <vector>
-#include <fstream>
 #include <chrono>
+#include <fstream>
 
-// Helper to write WAV header (can update later for streaming)
-static void write_wav_header(FILE * f, int sample_rate, int data_size) {
+// Streaming state
+struct stream_state {
+    std::vector<float> all_audio;
+    int chunks_received;
+    int total_samples;
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::chrono::high_resolution_clock::time_point first_audio_time;
+    bool first_chunk;
+    FILE * raw_output;  // Optional: write raw PCM as it arrives
+};
+
+// Audio callback - called for each chunk of audio
+bool on_audio_chunk(const float * samples, int n_samples, void * user_data) {
+    stream_state * state = (stream_state *)user_data;
+
+    if (state->first_chunk) {
+        state->first_audio_time = std::chrono::high_resolution_clock::now();
+        state->first_chunk = false;
+        double latency_ms = std::chrono::duration<double, std::milli>(
+            state->first_audio_time - state->start_time).count();
+        fprintf(stderr, "[STREAM] First audio chunk! Latency: %.1f ms\n", latency_ms);
+    }
+
+    // Store audio
+    state->all_audio.insert(state->all_audio.end(), samples, samples + n_samples);
+    state->chunks_received++;
+    state->total_samples += n_samples;
+
+    // Write to raw output if enabled
+    if (state->raw_output) {
+        std::vector<int16_t> pcm(n_samples);
+        for (int i = 0; i < n_samples; i++) {
+            float s = samples[i];
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            pcm[i] = (int16_t)(s * 32767.0f);
+        }
+        fwrite(pcm.data(), sizeof(int16_t), n_samples, state->raw_output);
+        fflush(state->raw_output);
+    }
+
+    double audio_ms = (double)n_samples / 22.05;  // 22050 Hz
+    fprintf(stderr, "[STREAM] Chunk %d: %d samples (%.1f ms audio)\n",
+            state->chunks_received, n_samples, audio_ms);
+
+    return true;  // Continue generation
+}
+
+// Progress callback
+void on_progress(int frames, int sentence_idx, int total_sentences, void * user_data) {
+    (void)user_data;
+    fprintf(stderr, "[PROGRESS] Sentence %d/%d, %d frames generated\n",
+            sentence_idx + 1, total_sentences, frames);
+}
+
+// Helper to write WAV file
+static bool write_wav(const char * path, const std::vector<float> & audio, int sample_rate) {
+    FILE * f = fopen(path, "wb");
+    if (!f) return false;
+
+    int32_t data_size = audio.size() * sizeof(int16_t);
     int32_t file_size = 36 + data_size;
 
-    fseek(f, 0, SEEK_SET);
     fwrite("RIFF", 1, 4, f);
     fwrite(&file_size, 4, 1, f);
     fwrite("WAVE", 1, 4, f);
-
-    // fmt chunk
     fwrite("fmt ", 1, 4, f);
     int32_t fmt_size = 16;
-    int16_t audio_format = 1;  // PCM
+    int16_t audio_format = 1;
     int16_t num_channels = 1;
     int32_t byte_rate = sample_rate * 2;
     int16_t block_align = 2;
@@ -33,83 +88,80 @@ static void write_wav_header(FILE * f, int sample_rate, int data_size) {
     fwrite(&byte_rate, 4, 1, f);
     fwrite(&block_align, 2, 1, f);
     fwrite(&bits_per_sample, 2, 1, f);
-
-    // data chunk header
     fwrite("data", 1, 4, f);
     fwrite(&data_size, 4, 1, f);
-}
 
-// Write audio samples to file
-static void write_audio_samples(FILE * f, const std::vector<float> & audio) {
     for (float sample : audio) {
         if (sample > 1.0f) sample = 1.0f;
         if (sample < -1.0f) sample = -1.0f;
-        int16_t s = static_cast<int16_t>(sample * 32767.0f);
+        int16_t s = (int16_t)(sample * 32767.0f);
         fwrite(&s, 2, 1, f);
     }
+
+    fclose(f);
+    return true;
 }
 
 int main(int argc, char ** argv) {
     const char * model_path = "weights/magpie-357m-f32.gguf";
     const char * codec_path = "weights/nano-codec-f32.gguf";
-    const char * text_input = nullptr;
-    const char * output_wav = "output_streaming.wav";
-    int chunk_frames = 20;  // Decode every N frames
+    const char * text = nullptr;
+    const char * output_path = "output_streaming.wav";
+    const char * raw_output_path = nullptr;
+    int frames_per_chunk = 4;
+    bool sentence_chunking = true;
 
-    // Parse args
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             codec_path = argv[++i];
         } else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) {
-            text_input = argv[++i];
+            text = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
-            output_wav = argv[++i];
-        } else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
-            chunk_frames = atoi(argv[++i]);
+            output_path = argv[++i];
+        } else if (strcmp(argv[i], "--raw") == 0 && i + 1 < argc) {
+            raw_output_path = argv[++i];
+        } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
+            frames_per_chunk = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-sentence-chunk") == 0) {
+            sentence_chunking = false;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("Streaming TTS Test\n\n");
+            printf("Usage: %s [options]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  --model PATH        Model GGUF path\n");
+            printf("  --codec PATH        Codec GGUF path\n");
+            printf("  --text TEXT         Text to synthesize\n");
+            printf("  --output PATH       Output WAV file\n");
+            printf("  --raw PATH          Write raw PCM as it streams (for piping)\n");
+            printf("  --chunk-size N      Frames per audio chunk (default: 4)\n");
+            printf("  --no-sentence-chunk Disable sentence-level chunking\n");
+            return 0;
         }
     }
 
-    printf("=== Magpie TTS Streaming Test ===\n");
-    printf("Model: %s\n", model_path);
-    printf("Codec: %s\n", codec_path);
-    printf("Output: %s\n", output_wav);
-    printf("Chunk size: %d frames\n", chunk_frames);
-    printf("\n");
+    if (!text) {
+        text = "Hello! This is a streaming test. Each sentence is processed separately. "
+               "Audio chunks are output as they become available.";
+    }
 
-    // Initialize model
+    printf("=== Streaming TTS Test ===\n");
+    printf("Text: \"%s\"\n", text);
+    printf("Frames per chunk: %d (~%.0f ms audio latency)\n",
+           frames_per_chunk, frames_per_chunk * 1024.0 / 22.05);
+    printf("Sentence chunking: %s\n\n", sentence_chunking ? "enabled" : "disabled");
+
+    // Load model
     printf("Loading model...\n");
     magpie_context * ctx = magpie_init(model_path);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
-    printf("Model loaded, backend: %s\n", magpie_get_backend_name(ctx));
-
-    // Get text input
-    if (!text_input) {
-        text_input = "Hello, this is a streaming test of the Magpie text to speech system. "
-                     "It should generate audio incrementally without any hard limits.";
-    }
-    printf("Input: \"%s\"\n", text_input);
-
-    // Tokenize
-    std::vector<int32_t> tokens = magpie_tokenize(&ctx->model.tokenizer, text_input);
-    if (tokens.empty()) {
-        fprintf(stderr, "Tokenization failed\n");
-        magpie_free(ctx);
-        return 1;
-    }
-    printf("Tokenized to %zu tokens\n\n", tokens.size());
-
-    // Set parameters - no practical limit
-    ctx->temperature = 0.7f;
-    ctx->top_k = 80;
-    ctx->speaker_id = 0;
-    ctx->model.hparams.max_dec_steps = 10000;  // Very high limit, rely on EOS
 
     // Load codec
+    printf("Loading codec...\n");
     magpie_codec * codec = magpie_codec_init(codec_path);
     if (!codec) {
         fprintf(stderr, "Failed to load codec\n");
@@ -117,91 +169,68 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Open output file
-    FILE * wav_file = fopen(output_wav, "wb");
-    if (!wav_file) {
-        fprintf(stderr, "Failed to open output file\n");
-        magpie_codec_free(codec);
-        magpie_free(ctx);
-        return 1;
-    }
+    // Initialize streaming state
+    stream_state state = {};
+    state.first_chunk = true;
+    state.start_time = std::chrono::high_resolution_clock::now();
 
-    // Write placeholder header (will update at end)
-    write_wav_header(wav_file, 22050, 0);
-
-    printf("=== Generating Audio (Streaming) ===\n");
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // Generate codes using optimized version
-    std::vector<int32_t> all_codes = magpie_synthesize_codes_optimized(ctx, tokens.data(), tokens.size());
-
-    auto gen_time = std::chrono::high_resolution_clock::now();
-    double gen_seconds = std::chrono::duration<double>(gen_time - start_time).count();
-
-    if (all_codes.empty()) {
-        fprintf(stderr, "Synthesis failed\n");
-        fclose(wav_file);
-        magpie_codec_free(codec);
-        magpie_free(ctx);
-        return 1;
-    }
-
-    int total_frames = all_codes.size() / 8;
-    printf("Generated %d frames in %.2f seconds (%.1f fps)\n",
-           total_frames, gen_seconds, total_frames / gen_seconds);
-
-    // Decode in chunks
-    printf("\n=== Decoding Audio (Chunked) ===\n");
-    int total_samples = 0;
-    int frames_decoded = 0;
-
-    while (frames_decoded < total_frames) {
-        int chunk_size = std::min(chunk_frames, total_frames - frames_decoded);
-
-        // Reorder codes for this chunk: [n_frames * 8] -> [8, n_frames]
-        std::vector<int32_t> chunk_codes(chunk_size * 8);
-        for (int t = 0; t < chunk_size; t++) {
-            for (int cb = 0; cb < 8; cb++) {
-                chunk_codes[cb * chunk_size + t] = all_codes[(frames_decoded + t) * 8 + cb];
-            }
+    if (raw_output_path) {
+        state.raw_output = fopen(raw_output_path, "wb");
+        if (!state.raw_output) {
+            fprintf(stderr, "Warning: Could not open raw output file\n");
         }
-
-        // Decode chunk
-        std::vector<float> audio = magpie_codec_decode(codec, chunk_codes.data(), chunk_size);
-
-        if (audio.empty()) {
-            fprintf(stderr, "Decode failed at frame %d\n", frames_decoded);
-            break;
-        }
-
-        // Write to file
-        write_audio_samples(wav_file, audio);
-        total_samples += audio.size();
-        frames_decoded += chunk_size;
-
-        printf("  Decoded frames %d-%d (%d samples, %.2f sec cumulative)\n",
-               frames_decoded - chunk_size, frames_decoded - 1,
-               (int)audio.size(), (float)total_samples / 22050.0f);
     }
+
+    // Set up streaming parameters
+    magpie_stream_params params;
+    params.temperature = 0.7f;
+    params.top_k = 80;
+    params.speaker_id = 0;
+    params.frames_per_chunk = frames_per_chunk;
+    params.sentence_chunking = sentence_chunking;
+    params.on_audio = on_audio_chunk;
+    params.on_progress = on_progress;
+    params.user_data = &state;
+
+    // Run streaming synthesis
+    printf("\n=== Starting Streaming Synthesis ===\n");
+    int total_samples = magpie_synthesize_streaming(ctx, codec, text, params);
 
     auto end_time = std::chrono::high_resolution_clock::now();
-    double total_seconds = std::chrono::duration<double>(end_time - start_time).count();
+    double total_time = std::chrono::duration<double>(end_time - state.start_time).count();
 
-    // Update WAV header with final size
-    int data_size = total_samples * sizeof(int16_t);
-    write_wav_header(wav_file, 22050, data_size);
-    fclose(wav_file);
+    if (state.raw_output) {
+        fclose(state.raw_output);
+    }
 
-    float audio_duration = (float)total_samples / 22050.0f;
-    printf("\n=== Summary ===\n");
-    printf("Total frames: %d\n", total_frames);
-    printf("Audio duration: %.2f seconds\n", audio_duration);
-    printf("Generation time: %.2f seconds\n", gen_seconds);
-    printf("Total time (gen + decode): %.2f seconds\n", total_seconds);
-    printf("Real-time factor: %.2fx\n", audio_duration / total_seconds);
-    printf("Saved to: %s\n", output_wav);
+    if (total_samples < 0) {
+        fprintf(stderr, "Streaming synthesis failed!\n");
+        magpie_codec_free(codec);
+        magpie_free(ctx);
+        return 1;
+    }
 
-    // Cleanup
+    // Results
+    printf("\n=== Streaming Complete ===\n");
+    printf("Total chunks: %d\n", state.chunks_received);
+    printf("Total samples: %d (%.2f seconds audio)\n",
+           total_samples, total_samples / 22050.0f);
+    printf("Total time: %.2f seconds\n", total_time);
+    printf("Real-time factor: %.2fx\n", (total_samples / 22050.0f) / total_time);
+
+    if (!state.first_chunk) {
+        double latency = std::chrono::duration<double, std::milli>(
+            state.first_audio_time - state.start_time).count();
+        printf("Time to first audio: %.1f ms\n", latency);
+    }
+
+    // Save final WAV
+    if (!state.all_audio.empty()) {
+        if (write_wav(output_path, state.all_audio, 22050)) {
+            printf("Saved: %s\n", output_path);
+        }
+    }
+
     magpie_codec_free(codec);
     magpie_free(ctx);
 

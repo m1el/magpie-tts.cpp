@@ -306,11 +306,15 @@ def convert_magpie_to_gguf(
         n_elements = int(np.prod(data.shape))
 
         # Decide whether to quantize
+        # Block-based quantization requires inner dimension >= block_size (32 for q8_0/q4_0)
+        inner_dim = data.shape[-1] if len(data.shape) >= 1 else 0
+        block_size = 32  # QK8_0 and QK4_0 block sizes
         do_quantize = (
             ggml_quant_type != GGML_TYPE_F32
             and should_quantize(name, quant_patterns)
             and n_elements >= 256
             and len(data.shape) >= 2
+            and inner_dim >= block_size  # Must have enough elements per row for block quantization
         )
 
         if do_quantize:
