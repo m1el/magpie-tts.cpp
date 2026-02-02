@@ -38,7 +38,7 @@ ifeq ($(METAL_AVAILABLE),1)
 endif
 
 # Source files
-SRCS = src/magpie.cpp src/magpie-codec.cpp
+SRCS = src/magpie.cpp src/nano-codec.cpp
 
 .PHONY: all clean check-header
 

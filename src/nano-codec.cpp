@@ -81,35 +81,6 @@ static void read_codec_hparams(gguf_context * gguf_ctx, magpie_codec_hparams & h
     hparams.latent_dim      = get_i32("codec.latent_dim", hparams.latent_dim);
 }
 
-//
-// Tensor mapping helpers
-//
-
-// Parse layer index from tensor name like "audio_decoder.res_layers.2.res_blocks.1.res_blocks.0..."
-static bool parse_indices(const char * name, const char * prefix, int * idx1, int * idx2 = nullptr, int * idx3 = nullptr) {
-    const char * p = strstr(name, prefix);
-    if (!p) return false;
-    p += strlen(prefix);
-
-    if (idx1) {
-        if (*p != '.') return false;
-        *idx1 = atoi(++p);
-        while (*p && *p != '.') p++;
-    }
-    if (idx2) {
-        if (!strstr(p, ".res_blocks.")) return false;
-        p = strstr(p, ".res_blocks.") + strlen(".res_blocks.");
-        *idx2 = atoi(p);
-        while (*p && *p != '.') p++;
-    }
-    if (idx3) {
-        if (!strstr(p, ".res_blocks.")) return false;
-        p = strstr(p, ".res_blocks.") + strlen(".res_blocks.");
-        *idx3 = atoi(p);
-    }
-    return true;
-}
-
 static void map_codec_tensor(const char * name, ggml_tensor * t, magpie_codec & codec) {
     // Short tensor names format:
     // dec.pre.{weight,bias} - pre conv
@@ -280,7 +251,6 @@ bool magpie_codec_load(const std::string & path, magpie_codec & codec, magpie_ba
     size_t ctx_size = 0;
     for (int i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gguf_ctx, i);
-        size_t offset = gguf_get_tensor_offset(gguf_ctx, i);
         struct ggml_tensor * t = ggml_get_tensor(codec.ctx_w, name);
         size_t size = ggml_nbytes(t);
         ctx_size += size;
@@ -468,10 +438,7 @@ struct ggml_tensor * magpie_codec_build_causal_conv1d(
     //   data b:   [L, IC] (ne[0]=L, ne[1]=IC)
     // Output: [OL, OC] where OL = (L + 2*padding - dilation*(K-1) - 1) / stride + 1
     int kernel_size = weight->ne[0];
-    int in_ch = weight->ne[1];
     int out_ch = weight->ne[2];
-    int64_t T = input->ne[0];
-    (void)in_ch;  // Used for documentation
 
     // Effective kernel size with dilation
     int eff_kernel = (kernel_size - 1) * dilation + 1;

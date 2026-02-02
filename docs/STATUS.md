@@ -19,18 +19,35 @@ Port NVIDIA Magpie TTS (357M multilingual) from PyTorch/NeMo to GGML for efficie
 ### Generated Artifacts
 ```
 weights/
-├── magpie-357m-f32.gguf   (855 MB) - Full precision
-├── magpie-357m-q8.gguf    (277 MB) - Q8 quantized
-└── nano-codec-f32.gguf    (120 MB) - Audio codec decoder
+├── magpie-357m-f32.gguf   (858 MB) - Full precision
+├── magpie-357m-f16.gguf   (465 MB) - F16 precision (54% of F32)
+├── magpie-357m-q8.gguf    (679 MB) - Q8 quantized (79% of F32)
+└── nano-codec-f32.gguf    (121 MB) - Audio codec decoder
 
 test_data/reference/       (77 files) - Reference tensors for layer testing
 ```
 
-### Documentation Created
-- `MAGPIE_ARCHITECTURE.md` - Model architecture with tensor shapes
-- `MAGPIE_INFERENCE_FINDINGS.md` - Inference flow analysis
-- `GGML_PORT_PLAN.md` - Implementation plan with milestones
-- `GGML_INIT_OUTLINE.md` - GGML initialization architecture (structs, loading, graphs)
+### Project Structure
+```
+src/
+├── magpie-tts.cpp    # Main CLI binary
+├── magpie.cpp        # TTS model implementation
+├── magpie.h          # Header file
+└── nano-codec.cpp    # Audio codec (HiFiGAN decoder)
+
+docs/                 # Documentation (architecture, plans, status)
+weights/              # GGUF model files + README
+scripts/              # Conversion scripts
+tests/                # Component and integration tests
+```
+
+### Documentation
+- `README.md` - Project overview and usage
+- `LICENSE` - MIT License
+- `docs/MAGPIE_ARCHITECTURE.md` - Model architecture with tensor shapes
+- `docs/MAGPIE_INFERENCE_FINDINGS.md` - Inference flow analysis
+- `docs/GGML_PORT_PLAN.md` - Implementation plan with milestones
+- `docs/GGML_INIT_OUTLINE.md` - GGML initialization architecture
 
 ## Current Phase: Implementation
 
@@ -534,7 +551,8 @@ REMAINING OPTIMIZATION:
 
 KEY FILES:
 - src/magpie.cpp, src/magpie.h - main TTS model implementation
-- src/magpie-codec.cpp - audio codec implementation
+- src/nano-codec.cpp - audio codec implementation
+- src/magpie-tts.cpp - main CLI binary
 - tests/test_e2e_inference.cpp - end-to-end test
 - test_data/reference/ - PyTorch reference tensors (column-major format)
 ```

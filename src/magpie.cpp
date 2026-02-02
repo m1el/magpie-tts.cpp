@@ -951,7 +951,6 @@ static ggml_tensor * build_local_transformer_layer(
 
     if (!input || !lt) return nullptr;
 
-    const int64_t lt_dim = input->ne[0];
     const int64_t seq_len = input->ne[1];
 
     // Self-attention block
@@ -1726,7 +1725,6 @@ ggml_tensor * magpie_build_cross_attention_cached(
 
     if (!query || !k_cached || !v_cached || !q_weight || !out_weight) return nullptr;
 
-    const int64_t d_model = query->ne[0];
     const int64_t q_len = query->ne[1];
     const int64_t enc_seq = k_cached->ne[1];
     const int64_t d_qkv = n_heads * d_head;
@@ -2015,7 +2013,6 @@ ggml_tensor * magpie_build_cross_attention(
 
     if (!query || !memory || !q_weight || !kv_weight || !out_weight) return nullptr;
 
-    const int64_t d_model = query->ne[0];
     const int64_t dec_seq = query->ne[1];
     const int64_t enc_seq = memory->ne[1];
     const int64_t d_xa = n_heads * d_head;
@@ -3283,7 +3280,7 @@ bool magpie_is_eos(const std::vector<int32_t> & frame_codes, int32_t eos_id) {
 ggml_tensor * magpie_get_baked_context(
     ggml_context * ctx,
     magpie_embeddings * embeddings,
-    int speaker_id,
+    int /* speaker_id */,
     int context_frames,
     int d_model) {
     if (!ctx || !embeddings || !embeddings->baked_context_w) {
@@ -4025,7 +4022,6 @@ static ggml_tensor * magpie_build_batched_decoder_layer_gpu(
 
     // Cross-attention for batched queries
     // norm_q: [d_model, batch_size], xa_k/v: [d_xa, enc_seq]
-    const int64_t d_model = norm_q->ne[0];
     const int n_heads = hp->dec_xa_heads;
     const int d_head = hp->dec_xa_d_head;
     const int64_t enc_seq = xa_k_cached->ne[1];
@@ -4263,7 +4259,6 @@ std::vector<int32_t> magpie_synthesize_codes_graph_reuse(
 
     // Process BOS frame and start autoregressive loop
     std::vector<float> decoder_hidden(d_model);
-    bool allocr_reserved = false;
 
     // Step 7: Autoregressive generation with allocator reuse
     fprintf(stderr, "magpie: [graph-reuse] starting autoregressive decoding...\n");
@@ -4312,7 +4307,6 @@ std::vector<int32_t> magpie_synthesize_codes_graph_reuse(
 
         // Reserve allocator for this graph size (will be reused)
         ggml_gallocr_reserve(persistent_allocr, gf);
-        allocr_reserved = true;
 
         ggml_gallocr_alloc_graph(persistent_allocr, gf);
         ggml_backend_tensor_set(input, bos_emb.data(), 0, d_model * sizeof(float));
