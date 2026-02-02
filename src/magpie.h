@@ -80,6 +80,36 @@ struct magpie_hparams {
 };
 
 //
+// Tokenizer - converts text to phoneme token IDs
+//
+
+struct magpie_tokenizer {
+    // Vocabulary: token_id -> token string
+    std::vector<std::string> vocab;
+
+    // Reverse vocabulary: token string -> token_id
+    std::map<std::string, int32_t> token_to_id;
+
+    // Pronunciation dictionary: word -> IPA phoneme string
+    std::map<std::string, std::string> dict;
+
+    // Special token IDs
+    int32_t pad_id   = -1;
+    int32_t oov_id   = -1;
+    int32_t space_id = -1;
+    int32_t bos_id   = -1;
+    int32_t eos_id   = -1;
+
+    bool loaded = false;
+};
+
+// Initialize tokenizer from GGUF metadata
+bool magpie_tokenizer_init(magpie_tokenizer * tok, struct gguf_context * gguf_ctx);
+
+// Tokenize text to token IDs (includes BOS/EOS)
+std::vector<int32_t> magpie_tokenize(const magpie_tokenizer * tok, const std::string & text);
+
+//
 // Weight Structures - Encoder
 //
 
@@ -181,6 +211,7 @@ struct magpie_final_proj {
 
 struct magpie_model {
     magpie_hparams hparams;
+    magpie_tokenizer tokenizer;
 
     // Weight structures
     magpie_embeddings embeddings;
@@ -275,6 +306,12 @@ struct magpie_context {
     magpie_context() : n_threads(4), temperature(0.7f), top_k(80), speaker_id(0), codec(nullptr) {}
 };
 
+// Sampling result from local transformer (for EOS detection)
+struct magpie_sample_result {
+    std::vector<int32_t> sampled_codes;  // Temperature-sampled codes
+    std::vector<int32_t> argmax_codes;   // Argmax codes (for EOS detection)
+};
+
 //
 // API Functions
 //
@@ -331,11 +368,13 @@ struct ggml_tensor * magpie_build_local_transformer_seq(
     const struct magpie_hparams * hparams);
 
 // Full local transformer sampling: autoregressively sample all 8 codebooks
-std::vector<int32_t> magpie_local_transformer_sample_all(
+// Returns both sampled codes and argmax codes for EOS detection
+struct magpie_sample_result magpie_local_transformer_sample_all(
     struct magpie_context * mctx,
     const float * decoder_hidden_data,
     float temperature,
-    int top_k);
+    int top_k,
+    bool forbid_eos = false);  // Set true during first min_generated_frames
 
 //
 // Component Building Functions
@@ -536,6 +575,13 @@ std::vector<int32_t> magpie_synthesize_codes(
 
 // Optimized synthesis using KV cache (O(n) per step instead of O(n²))
 std::vector<int32_t> magpie_synthesize_codes_cached(
+    struct magpie_context * ctx,
+    const int32_t * tokens,
+    int n_tokens);
+
+// Fully optimized synthesis with GPU-resident KV cache (no CPU round-trips)
+// Uses ggml_cpy pattern to update cache in-place on GPU
+std::vector<int32_t> magpie_synthesize_codes_optimized(
     struct magpie_context * ctx,
     const int32_t * tokens,
     int n_tokens);

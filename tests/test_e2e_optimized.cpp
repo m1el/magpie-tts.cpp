@@ -1,5 +1,5 @@
-// End-to-end inference test for Magpie TTS using KV-cached synthesis
-// Tests the optimized pipeline with O(n) per-step complexity
+// End-to-end inference test for Magpie TTS using GPU-optimized KV cache
+// Tests the fully optimized pipeline with GPU-resident cache (no CPU round-trips)
 
 #include "magpie.h"
 #include <cstdio>
@@ -87,8 +87,9 @@ int main(int argc, char ** argv) {
     const char * codec_path = "weights/nano-codec-f32.gguf";
     const char * tokens_path = nullptr;
     const char * text_input = nullptr;
-    const char * output_wav = "output_cached.wav";
-    bool compare_with_uncached = false;
+    const char * output_wav = "output_optimized.wav";
+    bool compare_all = false;
+    bool deterministic = false;
 
     // Parse args
     for (int i = 1; i < argc; i++) {
@@ -102,12 +103,14 @@ int main(int argc, char ** argv) {
             text_input = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_wav = argv[++i];
-        } else if (strcmp(argv[i], "--compare") == 0) {
-            compare_with_uncached = true;
+        } else if (strcmp(argv[i], "--compare-all") == 0) {
+            compare_all = true;
+        } else if (strcmp(argv[i], "--deterministic") == 0) {
+            deterministic = true;
         }
     }
 
-    printf("=== Magpie TTS KV-Cached Inference Test ===\n");
+    printf("=== Magpie TTS GPU-Optimized KV Cache Test ===\n");
     printf("Model: %s\n", model_path);
     printf("Codec: %s\n", codec_path);
     printf("Output: %s\n", output_wav);
@@ -159,28 +162,35 @@ int main(int argc, char ** argv) {
     }
 
     // Set inference parameters
-    ctx->temperature = 0.7f;
-    ctx->top_k = 80;
+    if (deterministic) {
+        ctx->temperature = 0.0f;  // Argmax sampling
+        ctx->top_k = 1;
+        printf("Mode: Deterministic (argmax)\n");
+    } else {
+        ctx->temperature = 0.7f;
+        ctx->top_k = 80;
+        printf("Mode: Stochastic (temp=0.7, top_k=80)\n");
+    }
     ctx->speaker_id = 0;
     ctx->model.hparams.max_dec_steps = 500;  // Allow natural EOS detection
 
-    // Synthesize with cached version
-    printf("\n=== Synthesizing Audio Codes (KV-Cached) ===\n");
-    auto start_cached = std::chrono::high_resolution_clock::now();
-    std::vector<int32_t> codes = magpie_synthesize_codes_cached(ctx, tokens.data(), tokens.size());
-    auto end_cached = std::chrono::high_resolution_clock::now();
-    double cached_time = std::chrono::duration<double>(end_cached - start_cached).count();
+    // Synthesize with GPU-optimized version
+    printf("\n=== Synthesizing Audio Codes (GPU-Optimized) ===\n");
+    auto start_opt = std::chrono::high_resolution_clock::now();
+    std::vector<int32_t> codes = magpie_synthesize_codes_optimized(ctx, tokens.data(), tokens.size());
+    auto end_opt = std::chrono::high_resolution_clock::now();
+    double opt_time = std::chrono::duration<double>(end_opt - start_opt).count();
 
     if (codes.empty()) {
-        fprintf(stderr, "Cached synthesis failed!\n");
+        fprintf(stderr, "GPU-optimized synthesis failed!\n");
         magpie_free(ctx);
         return 1;
     }
 
     int n_frames = codes.size() / 8;
     printf("Generated %d audio frames (%zu codes) in %.2f seconds\n",
-           n_frames, codes.size(), cached_time);
-    printf("Speed: %.1f frames/second\n", n_frames / cached_time);
+           n_frames, codes.size(), opt_time);
+    printf("Speed: %.1f frames/second\n", n_frames / opt_time);
 
     // Print first few frames
     printf("First 3 frames:\n");
@@ -192,26 +202,51 @@ int main(int argc, char ** argv) {
         printf("\n");
     }
 
-    // Optionally compare with uncached version
-    if (compare_with_uncached) {
-        printf("\n=== Synthesizing Audio Codes (Uncached - for comparison) ===\n");
+    // Compare with other versions
+    if (compare_all) {
+        printf("\n=== Comparison with Other Versions ===\n");
+
+        // Uncached version
+        printf("\nRunning uncached version...\n");
         auto start_uncached = std::chrono::high_resolution_clock::now();
         std::vector<int32_t> codes_uncached = magpie_synthesize_codes(ctx, tokens.data(), tokens.size());
         auto end_uncached = std::chrono::high_resolution_clock::now();
         double uncached_time = std::chrono::duration<double>(end_uncached - start_uncached).count();
 
-        printf("Uncached: %.2f seconds, Cached: %.2f seconds\n", uncached_time, cached_time);
-        printf("Speedup: %.2fx\n", uncached_time / cached_time);
+        // Cached version
+        printf("Running cached version...\n");
+        auto start_cached = std::chrono::high_resolution_clock::now();
+        std::vector<int32_t> codes_cached = magpie_synthesize_codes_cached(ctx, tokens.data(), tokens.size());
+        auto end_cached = std::chrono::high_resolution_clock::now();
+        double cached_time = std::chrono::duration<double>(end_cached - start_cached).count();
 
-        // Compare codes
-        if (codes_uncached.size() == codes.size()) {
-            int diff_count = 0;
-            for (size_t i = 0; i < codes.size(); i++) {
-                if (codes[i] != codes_uncached[i]) diff_count++;
+        printf("\nTiming Results:\n");
+        printf("  Uncached:      %.2f seconds\n", uncached_time);
+        printf("  Cached:        %.2f seconds\n", cached_time);
+        printf("  GPU-Optimized: %.2f seconds\n", opt_time);
+        printf("\nSpeedups vs Uncached:\n");
+        printf("  Cached:        %.2fx\n", uncached_time / cached_time);
+        printf("  GPU-Optimized: %.2fx\n", uncached_time / opt_time);
+
+        // Compare outputs
+        printf("\nOutput Comparison:\n");
+
+        auto compare_codes = [](const std::vector<int32_t>& a, const std::vector<int32_t>& b, const char* name) {
+            if (a.size() != b.size()) {
+                printf("  %s: size mismatch (%zu vs %zu)\n", name, a.size(), b.size());
+                return;
             }
-            printf("Code differences: %d / %zu (%.1f%%)\n",
-                   diff_count, codes.size(), 100.0 * diff_count / codes.size());
-        }
+            int diff_count = 0;
+            for (size_t i = 0; i < a.size(); i++) {
+                if (a[i] != b[i]) diff_count++;
+            }
+            printf("  %s: %d / %zu codes differ (%.1f%%)\n",
+                   name, diff_count, a.size(), 100.0 * diff_count / a.size());
+        };
+
+        compare_codes(codes, codes_uncached, "Optimized vs Uncached");
+        compare_codes(codes, codes_cached, "Optimized vs Cached");
+        compare_codes(codes_cached, codes_uncached, "Cached vs Uncached");
     }
 
     // Load codec and decode to audio
@@ -224,13 +259,13 @@ int main(int argc, char ** argv) {
     }
 
     // Decode in chunks to work around CUDA IM2COL issue with large frame counts
-    const int CHUNK_SIZE = 32;
+    const int CHUNK_SIZE = 32;  // Frames per chunk (32 works reliably)
     std::vector<float> audio;
 
     for (int chunk_start = 0; chunk_start < n_frames; chunk_start += CHUNK_SIZE) {
         int chunk_frames = std::min(CHUNK_SIZE, n_frames - chunk_start);
 
-        // Reorder codes for this chunk
+        // Reorder codes for this chunk: [chunk_frames * 8] -> [8, chunk_frames]
         std::vector<int32_t> chunk_codes(chunk_frames * 8);
         for (int t = 0; t < chunk_frames; t++) {
             for (int cb = 0; cb < 8; cb++) {

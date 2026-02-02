@@ -234,6 +234,44 @@ def convert_magpie_to_gguf(
         "magpie.mask_token_id": 2020,
     }
 
+    # String hparams (vocabulary and dictionary)
+    string_hparams = {}
+
+    # Try to extract tokenizer vocabulary from model
+    tokenizer_data_dir = Path(__file__).parent.parent / "tokenizer_data"
+    vocab_file = tokenizer_data_dir / "vocab.txt"
+    dict_file = tokenizer_data_dir / "dict.txt"
+
+    if vocab_file.exists():
+        print(f"Loading vocabulary from {vocab_file}...")
+        with open(vocab_file, "r", encoding="utf-8") as f:
+            vocab_tokens = [line.rstrip('\n') for line in f]
+        # Store as newline-separated string (tokens don't contain newlines)
+        string_hparams["magpie.tokenizer.vocab"] = "\n".join(vocab_tokens)
+        hparams["magpie.tokenizer.vocab_size"] = len(vocab_tokens)
+        print(f"  Vocabulary size: {len(vocab_tokens)}")
+
+    if dict_file.exists():
+        print(f"Loading pronunciation dictionary from {dict_file}...")
+        # Store as word\tpron\n format (standard TSV)
+        with open(dict_file, "r", encoding="utf-8") as f:
+            dict_content = f.read()
+        string_hparams["magpie.tokenizer.dict"] = dict_content
+        dict_count = dict_content.count('\n')
+        hparams["magpie.tokenizer.dict_size"] = dict_count
+        print(f"  Dictionary entries: {dict_count}")
+
+    # Load special token info
+    special_file = tokenizer_data_dir / "special_tokens.txt"
+    if special_file.exists():
+        print(f"Loading special tokens from {special_file}...")
+        with open(special_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    if value != "None" and value.isdigit():
+                        hparams[f"magpie.tokenizer.{key}"] = int(value)
+
     # Prepare tensor info
     tensor_infos = []
     current_offset = 0
@@ -338,7 +376,7 @@ def convert_magpie_to_gguf(
         f.write(GGUF_MAGIC)
         f.write(struct.pack('<I', GGUF_VERSION))
         f.write(struct.pack('<q', len(tensor_infos)))  # n_tensors
-        f.write(struct.pack('<q', len(hparams) + 2))   # n_kv
+        f.write(struct.pack('<q', len(hparams) + len(string_hparams) + 2))   # n_kv
 
         # Write KV pairs
         write_kv_string(f, "general.architecture", "magpie")
@@ -349,6 +387,10 @@ def convert_magpie_to_gguf(
                 write_kv_uint32(f, key, value)
             elif isinstance(value, float):
                 write_kv_float32(f, key, value)
+
+        # Write string hparams (vocabulary, dictionary)
+        for key, value in string_hparams.items():
+            write_kv_string(f, key, value)
 
         # Write tensor infos
         for info in tensor_infos:

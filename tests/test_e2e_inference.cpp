@@ -1,5 +1,5 @@
-// End-to-end inference test for Magpie TTS using KV-cached synthesis
-// Tests the optimized pipeline with O(n) per-step complexity
+// End-to-end inference test for Magpie TTS
+// Tests the full pipeline: text -> encoder -> decoder -> local transformer -> codes -> audio
 
 #include "magpie.h"
 #include <cstdio>
@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <vector>
 #include <fstream>
-#include <chrono>
 
 // Helper to load tokens from a binary file
 static std::vector<int32_t> load_tokens(const char * path) {
@@ -18,6 +17,7 @@ static std::vector<int32_t> load_tokens(const char * path) {
     int64_t shape[4];
     f.read(reinterpret_cast<char*>(shape), 4 * sizeof(int64_t));
 
+    // For tokens, shape is [1, n_tokens, 1, 1] or similar
     // Find the non-1 dimension
     int64_t n_tokens = 1;
     for (int i = 0; i < 4; i++) {
@@ -72,6 +72,7 @@ static bool write_wav(const char * path, const std::vector<float> & audio, int s
 
     // Convert float to int16 and write
     for (float sample : audio) {
+        // Clamp to [-1, 1] and convert to int16
         if (sample > 1.0f) sample = 1.0f;
         if (sample < -1.0f) sample = -1.0f;
         int16_t s = static_cast<int16_t>(sample * 32767.0f);
@@ -87,8 +88,7 @@ int main(int argc, char ** argv) {
     const char * codec_path = "weights/nano-codec-f32.gguf";
     const char * tokens_path = nullptr;
     const char * text_input = nullptr;
-    const char * output_wav = "output_cached.wav";
-    bool compare_with_uncached = false;
+    const char * output_wav = "output.wav";
 
     // Parse args
     for (int i = 1; i < argc; i++) {
@@ -102,12 +102,10 @@ int main(int argc, char ** argv) {
             text_input = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_wav = argv[++i];
-        } else if (strcmp(argv[i], "--compare") == 0) {
-            compare_with_uncached = true;
         }
     }
 
-    printf("=== Magpie TTS KV-Cached Inference Test ===\n");
+    printf("=== Magpie TTS End-to-End Inference Test ===\n");
     printf("Model: %s\n", model_path);
     printf("Codec: %s\n", codec_path);
     printf("Output: %s\n", output_wav);
@@ -164,25 +162,20 @@ int main(int argc, char ** argv) {
     ctx->speaker_id = 0;
     ctx->model.hparams.max_dec_steps = 500;  // Allow natural EOS detection
 
-    // Synthesize with cached version
-    printf("\n=== Synthesizing Audio Codes (KV-Cached) ===\n");
-    auto start_cached = std::chrono::high_resolution_clock::now();
-    std::vector<int32_t> codes = magpie_synthesize_codes_cached(ctx, tokens.data(), tokens.size());
-    auto end_cached = std::chrono::high_resolution_clock::now();
-    double cached_time = std::chrono::duration<double>(end_cached - start_cached).count();
+    // Synthesize codes
+    printf("\n=== Synthesizing Audio Codes ===\n");
+    std::vector<int32_t> codes = magpie_synthesize_codes(ctx, tokens.data(), tokens.size());
 
     if (codes.empty()) {
-        fprintf(stderr, "Cached synthesis failed!\n");
+        fprintf(stderr, "Synthesis failed!\n");
         magpie_free(ctx);
         return 1;
     }
 
     int n_frames = codes.size() / 8;
-    printf("Generated %d audio frames (%zu codes) in %.2f seconds\n",
-           n_frames, codes.size(), cached_time);
-    printf("Speed: %.1f frames/second\n", n_frames / cached_time);
+    printf("Generated %d audio frames (%zu codes)\n", n_frames, codes.size());
 
-    // Print first few frames
+    // Print some generated codes
     printf("First 3 frames:\n");
     for (int t = 0; t < std::min(3, n_frames); t++) {
         printf("  Frame %d:", t);
@@ -192,33 +185,18 @@ int main(int argc, char ** argv) {
         printf("\n");
     }
 
-    // Optionally compare with uncached version
-    if (compare_with_uncached) {
-        printf("\n=== Synthesizing Audio Codes (Uncached - for comparison) ===\n");
-        auto start_uncached = std::chrono::high_resolution_clock::now();
-        std::vector<int32_t> codes_uncached = magpie_synthesize_codes(ctx, tokens.data(), tokens.size());
-        auto end_uncached = std::chrono::high_resolution_clock::now();
-        double uncached_time = std::chrono::duration<double>(end_uncached - start_uncached).count();
-
-        printf("Uncached: %.2f seconds, Cached: %.2f seconds\n", uncached_time, cached_time);
-        printf("Speedup: %.2fx\n", uncached_time / cached_time);
-
-        // Compare codes
-        if (codes_uncached.size() == codes.size()) {
-            int diff_count = 0;
-            for (size_t i = 0; i < codes.size(); i++) {
-                if (codes[i] != codes_uncached[i]) diff_count++;
-            }
-            printf("Code differences: %d / %zu (%.1f%%)\n",
-                   diff_count, codes.size(), 100.0 * diff_count / codes.size());
-        }
-    }
-
     // Load codec and decode to audio
     printf("\n=== Decoding to Audio ===\n");
     magpie_codec * codec = magpie_codec_init(codec_path);
     if (!codec) {
         fprintf(stderr, "Failed to load codec from %s\n", codec_path);
+        // Still save codes for debugging
+        FILE * f = fopen("output_codes.bin", "wb");
+        if (f) {
+            fwrite(codes.data(), sizeof(int32_t), codes.size(), f);
+            fclose(f);
+            printf("Saved codes to output_codes.bin\n");
+        }
         magpie_free(ctx);
         return 1;
     }
