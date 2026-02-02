@@ -23,6 +23,15 @@ Run `./magpie-tts --help` for all options.
 
 Notice: the weights are [Licensed by NVIDIA Corporation under the NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
 
+### Pre-converted GGUF Weights
+
+Download pre-converted weights from HuggingFace:
+https://huggingface.co/m1el/magpie-tts-multilingual-357m-gguf
+
+Place the downloaded files in the `weights/` directory.
+
+### Convert from NeMo (alternative)
+
 Convert from NeMo format using the conversion scripts:
 
 ```bash
