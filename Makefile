@@ -49,7 +49,7 @@ check-header:
 	$(CXX) $(CXXFLAGS) -fsyntax-only src/magpie.h
 
 # Main binary
-magpie-tts: examples/main.cpp $(SRCS)
+magpie-tts: src/magpie-tts.cpp $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Test loading weights
